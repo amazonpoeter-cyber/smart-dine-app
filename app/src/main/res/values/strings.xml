@@ -1,0 +1,13 @@
+<resources>
+    <string name="app_name">Smart Dine</string>
+    <string name="hero_title">Order from your table</string>
+    <string name="hero_subtitle">Fresh &amp; fast • Delivered straight to you</string>
+    <string name="view_menu">View Menu</string>
+    <string name="wifi_network_name">SmartDine_Guest</string>
+    <string name="wifi_password">smartdine2026</string>
+    <string name="place_order">Place Order</string>
+    <string name="payment_successful">Payment Successful</string>
+    <string name="admin_login">Admin Login</string>
+    <string name="demo_password_hint">Demo password: admin123</string>
+    <string name="logout_customer_view">Logout / Customer View</string>
+</resources>

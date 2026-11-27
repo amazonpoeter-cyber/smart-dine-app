@@ -1,0 +1,86 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="96dp"
+    android:height="96dp"
+    android:viewportWidth="100"
+    android:viewportHeight="100">
+
+    <!-- Outer Circular Track with Fork & Spoon -->
+    <!-- Left Fork Body & Prongs -->
+    <path
+        android:strokeColor="#0F172A"
+        android:strokeWidth="3.2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M 23,60 A 38,38 0 0,1 21,38" />
+    <path
+        android:strokeColor="#0F172A"
+        android:strokeWidth="2.2"
+        android:strokeLineCap="round"
+        android:pathData="M 18,44 L 18,36 M 21,44 L 21,34 M 24,44 L 24,36 M 18,44 C 18,48 24,48 24,44" />
+
+    <!-- Bottom Spoon Arc -->
+    <path
+        android:strokeColor="#0F172A"
+        android:strokeWidth="3.2"
+        android:strokeLineCap="round"
+        android:pathData="M 23,60 A 38,38 0 0,0 52,88" />
+    <path
+        android:fillColor="#0F172A"
+        android:pathData="M 22,62 C 24,67 29,70 33,67 C 36,64 34,58 30,56 C 26,54 20,57 22,62 Z" />
+
+    <!-- Top-Right Spoon Head & Arc -->
+    <path
+        android:strokeColor="#0891B2"
+        android:strokeWidth="3.2"
+        android:strokeLineCap="round"
+        android:pathData="M 52,12 A 38,38 0 0,1 82,35" />
+    <path
+        android:fillColor="#0891B2"
+        android:pathData="M 81,34 C 86,37 92,42 89,47 C 86,52 80,50 76,46 C 72,42 75,36 81,34 Z" />
+
+    <!-- Digital Pulse Concentric Rings (Teal / Cyan) -->
+    <!-- Outer Ring -->
+    <path
+        android:strokeColor="#0891B2"
+        android:strokeWidth="2.6"
+        android:strokeLineCap="round"
+        android:pathData="M 33,26 A 28,28 0 0,1 74,38" />
+    <path
+        android:strokeColor="#0891B2"
+        android:strokeWidth="2.6"
+        android:strokeLineCap="round"
+        android:pathData="M 30,37 A 28,28 0 0,0 36,65" />
+
+    <!-- Middle Ring -->
+    <path
+        android:strokeColor="#06B6D4"
+        android:strokeWidth="2.6"
+        android:strokeLineCap="round"
+        android:pathData="M 39,32 A 20,20 0 0,1 68,41" />
+    <path
+        android:strokeColor="#06B6D4"
+        android:strokeWidth="2.6"
+        android:strokeLineCap="round"
+        android:pathData="M 36,44 A 20,20 0 0,0 42,62" />
+
+    <!-- Inner Pulse Ring -->
+    <path
+        android:strokeColor="#00A896"
+        android:strokeWidth="2.6"
+        android:strokeLineCap="round"
+        android:pathData="M 45,39 A 12,12 0 0,1 62,45" />
+
+    <!-- Bullseye Target Dot -->
+    <path
+        android:fillColor="#0891B2"
+        android:pathData="M 50,42 A 2.5,2.5 0 1,1 50,47 A 2.5,2.5 0 1,1 50,42 Z" />
+
+    <!-- Pointing Finger / Touch Hand (Deep Navy #0F172A) -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:strokeColor="#0F172A"
+        android:strokeWidth="3.2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M 49,44 L 49,58 C 49,60 52,60 52,58 L 52,53 C 52,51 55,51 55,53 L 55,55 C 55,53 58,53 58,55 L 58,57 C 58,55 61,55 61,57 L 61,64 C 61,72 54,78 47,78 C 41,78 37,73 37,68 C 37,64 41,61 44,59 L 45,58 L 45,44 C 45,41 49,41 49,44 Z" />
+</vector>
