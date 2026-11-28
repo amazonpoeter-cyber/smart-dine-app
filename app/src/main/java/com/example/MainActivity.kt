@@ -1,5 +1,7 @@
 package com.example
 
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -47,8 +49,6 @@ import com.example.ui.components.CustomerSlideDrawer
 import com.example.ui.components.CustomerTopHeader
 import com.example.ui.components.EmployeeLoginDialog
 import com.example.ui.components.EmployeePortalScreen
-import com.example.ui.components.KioskActivationDialog
-import com.example.ui.components.KioskExitDialog
 import com.example.ui.customer.CustomerScreen
 import com.example.ui.kitchen.ChefWorkspaceScreen
 import com.example.ui.owner.OwnerDashboardScreen
@@ -60,15 +60,43 @@ import com.example.ui.theme.SmartDineTheme
 import com.example.util.AppStrings
 import com.example.util.DateUtils
 import com.example.viewmodel.RestaurantViewModel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import java.net.URLDecoder
 
 class MainActivity : ComponentActivity() {
+    private val _pendingOAuthUri = MutableStateFlow<Uri?>(null)
+    private val pendingOAuthUri: StateFlow<Uri?> = _pendingOAuthUri.asStateFlow()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        captureAuthCallbackIntent(intent)
         setContent {
             SmartDineTheme {
-                SmartDineRootApp()
+                val callbackUri by pendingOAuthUri.collectAsStateWithLifecycle()
+                SmartDineRootApp(
+                    oauthCallbackUri = callbackUri,
+                    onConsumeOAuthCallback = { _pendingOAuthUri.value = null }
+                )
             }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        captureAuthCallbackIntent(intent)
+    }
+
+    private fun captureAuthCallbackIntent(intent: Intent?) {
+        val data = intent?.data ?: return
+        val isSmartDineCallback = data.scheme.equals("smartdine", ignoreCase = true) &&
+            data.host.equals("login-callback", ignoreCase = true)
+        if (isSmartDineCallback) {
+            _pendingOAuthUri.value = data
+            intent.data = null
         }
     }
 }
@@ -77,7 +105,10 @@ class MainActivity : ComponentActivity() {
 fun TasteQrRootApp() = SmartDineRootApp()
 
 @Composable
-fun SmartDineRootApp() {
+fun SmartDineRootApp(
+    oauthCallbackUri: Uri? = null,
+    onConsumeOAuthCallback: () -> Unit = {}
+) {
     val context = LocalContext.current.applicationContext
     val storage = remember(context) { SharedPreferencesMenuStorage(context) }
     val supabaseClient = remember { SupabaseClient() }
@@ -97,10 +128,25 @@ fun SmartDineRootApp() {
     var showDrawer by remember { mutableStateOf(false) }
     var showAdminLoginDialog by remember { mutableStateOf(false) }
     var showEmployeeLoginDialog by remember { mutableStateOf(false) }
-    var showKioskActivationDialog by remember { mutableStateOf(false) }
-    var showKioskExitDialog by remember { mutableStateOf(false) }
     var showAdminChangePasswordDialog by remember { mutableStateOf(false) }
     var showEmployeeChangePinDialog by remember { mutableStateOf(false) }
+
+    LaunchedEffect(oauthCallbackUri) {
+        val uri = oauthCallbackUri ?: return@LaunchedEffect
+        val fragmentParams = parseUrlEncodedParams(uri.fragment)
+        val code = uri.getQueryParameter("code") ?: fragmentParams["code"]
+        val accessToken = fragmentParams["access_token"]
+        val errorDesc = uri.getQueryParameter("error_description")
+            ?: uri.getQueryParameter("error")
+            ?: fragmentParams["error_description"]
+            ?: fragmentParams["error"]
+        onConsumeOAuthCallback()
+        viewModel.handleGoogleOAuthCallback(
+            code = code,
+            accessTokenFromFragment = accessToken,
+            errorMessage = errorDesc
+        )
+    }
 
     LaunchedEffect(uiState.toastMessage) {
         val message = uiState.toastMessage ?: return@LaunchedEffect
@@ -126,9 +172,8 @@ fun SmartDineRootApp() {
             viewModel.logoutEmployeePortal()
         }
     } else if (uiState.isKioskModeActive) {
-        // Kiosk Lock: system Back prompts for Kiosk or Admin password instead of exiting
         BackHandler {
-            showKioskExitDialog = true
+            viewModel.exitKioskMode()
         }
     }
 
@@ -262,28 +307,12 @@ fun SmartDineRootApp() {
                 onDismiss = { showDrawer = false },
                 onSelectCustomerTab = viewModel::selectCustomerTab,
                 onLogoutCustomer = viewModel::logoutCustomer,
-                onOpenKioskActivation = { showKioskActivationDialog = true },
-                onOpenKioskExit = { showKioskExitDialog = true },
+                onOpenKioskActivation = viewModel::activateKioskMode,
+                onOpenKioskExit = viewModel::exitKioskMode,
                 onOpenEmployeeLogin = { showEmployeeLoginDialog = true },
                 onOpenAdminLogin = { showAdminLoginDialog = true }
             )
         }
-    }
-
-    if (showKioskActivationDialog) {
-        KioskActivationDialog(
-            strings = strings,
-            onDismiss = { showKioskActivationDialog = false },
-            onActivate = viewModel::activateKioskMode
-        )
-    }
-
-    if (showKioskExitDialog) {
-        KioskExitDialog(
-            strings = strings,
-            onDismiss = { showKioskExitDialog = false },
-            onExit = viewModel::exitKioskMode
-        )
     }
 
     if (showEmployeeLoginDialog) {
@@ -324,5 +353,21 @@ fun SmartDineRootApp() {
                 viewModel.changeEmployeePassword(loggedInEmployee.id, oldPass, newPass, confirmPass)
             }
         )
+    }
+}
+
+private fun parseUrlEncodedParams(raw: String?): Map<String, String> {
+    if (raw.isNullOrBlank()) return emptyMap()
+    return buildMap {
+        raw.split("&").forEach { pair ->
+            val idx = pair.indexOf('=')
+            if (idx > 0) {
+                val key = runCatching { URLDecoder.decode(pair.substring(0, idx), "UTF-8") }
+                    .getOrElse { pair.substring(0, idx) }
+                val value = runCatching { URLDecoder.decode(pair.substring(idx + 1), "UTF-8") }
+                    .getOrElse { pair.substring(idx + 1) }
+                put(key, value)
+            }
+        }
     }
 }

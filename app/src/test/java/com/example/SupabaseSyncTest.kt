@@ -177,4 +177,25 @@ class SupabaseSyncTest {
         assertNotNull(parsedSales)
         assertEquals(sales, parsedSales)
     }
+
+    @Test
+    fun beginGoogleOAuth_generatesPkceS256AuthorizeUrlAndPersistsVerifier() {
+        val client = SupabaseClient(
+            config = SupabaseConfig(
+                projectUrl = "https://exampleproject.supabase.co",
+                publishableKey = "sb_publishable_demo_key_12345"
+            )
+        )
+        var capturedVerifier: String? = null
+        val urlResult = client.beginGoogleOAuth { verifier -> capturedVerifier = verifier }
+        assertTrue(urlResult.isSuccess)
+        val url = urlResult.getOrThrow()
+        assertTrue(url.startsWith("https://exampleproject.supabase.co/auth/v1/authorize"))
+        assertTrue(url.contains("provider=google"))
+        assertTrue(url.contains("redirect_to=smartdine%3A%2F%2Flogin-callback"))
+        assertTrue(url.contains("code_challenge_method=s256"))
+        assertTrue(url.contains("code_challenge="))
+        assertNotNull(capturedVerifier)
+        assertTrue(capturedVerifier!!.length >= 43)
+    }
 }

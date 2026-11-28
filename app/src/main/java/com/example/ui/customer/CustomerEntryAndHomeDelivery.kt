@@ -35,7 +35,6 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -47,6 +46,7 @@ import com.example.ui.components.formatRs
 import com.example.ui.theme.*
 import com.example.util.LocalizedStrings
 import com.example.viewmodel.PasswordChangeResult
+import kotlinx.coroutines.launch
 import java.util.Locale
 import kotlin.math.abs
 
@@ -599,21 +599,22 @@ fun HomeDeliveryCheckoutDialog(
 fun CustomerAuthModal(
     strings: LocalizedStrings,
     onDismiss: () -> Unit,
-    onGoogleSignIn: () -> Unit,
-    onEmailAuth: (name: String, email: String, password: String) -> PasswordChangeResult,
-    onPhoneOtpAuth: (name: String, phone: String, otp: String) -> PasswordChangeResult
+    onGoogleSignIn: () -> PasswordChangeResult,
+    onSendEmailOtp: suspend (name: String, email: String) -> PasswordChangeResult,
+    onVerifyEmailOtp: suspend (name: String, email: String, otpCode: String) -> PasswordChangeResult,
+    onContinueAsGuest: () -> Unit
 ) {
-    var selectedAuthTab by remember { mutableIntStateOf(0) } // 0 = Email & Password, 1 = Phone & OTP
     var fullName by remember { mutableStateOf("") }
     var email by remember { mutableStateOf("") }
-    var password by remember { mutableStateOf("") }
-    var phone by remember { mutableStateOf("") }
     var otpCode by remember { mutableStateOf("") }
     var otpSent by remember { mutableStateOf(false) }
+    var statusMsg by remember { mutableStateOf<String?>(null) }
     var errorMsg by remember { mutableStateOf<String?>(null) }
+    var isSubmitting by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
 
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = { if (!isSubmitting) onDismiss() },
         containerColor = CrispWhite,
         title = {
             Row(
@@ -634,9 +635,20 @@ fun CustomerAuthModal(
                     .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                // 1. Continue with Google (Daraz-style prominent button)
+                // 1. Real Supabase Google OAuth Sign-In
                 OutlinedButton(
-                    onClick = onGoogleSignIn,
+                    onClick = {
+                        if (isSubmitting) return@OutlinedButton
+                        errorMsg = null
+                        statusMsg = null
+                        val res = onGoogleSignIn()
+                        if (res is PasswordChangeResult.Error) {
+                            errorMsg = res.message
+                        } else if (res is PasswordChangeResult.Success) {
+                            statusMsg = res.message
+                        }
+                    },
+                    enabled = !isSubmitting,
                     border = BorderStroke(1.2.dp, SlateBorder),
                     shape = RoundedCornerShape(14.dp),
                     colors = ButtonDefaults.outlinedButtonColors(containerColor = CrispWhite, contentColor = NavyPrimary),
@@ -669,76 +681,117 @@ fun CustomerAuthModal(
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     HorizontalDivider(modifier = Modifier.weight(1f), color = SlateBorder)
-                    Text("OR", style = MaterialTheme.typography.labelSmall, color = SlateHint)
+                    Text(strings.emailTab, style = MaterialTheme.typography.labelSmall, color = SlateHint)
                     HorizontalDivider(modifier = Modifier.weight(1f), color = SlateBorder)
                 }
 
-                // Auth Method Toggle: Email & Password vs Phone & OTP
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    FilterChip(
-                        selected = selectedAuthTab == 0,
-                        onClick = { selectedAuthTab = 0; errorMsg = null },
-                        label = { Text(strings.emailTab, style = MaterialTheme.typography.labelSmall) },
-                        colors = FilterChipDefaults.filterChipColors(selectedContainerColor = NavyPrimary, selectedLabelColor = CrispWhite),
-                        modifier = Modifier.weight(1f).testTag("auth_tab_email")
-                    )
-                    FilterChip(
-                        selected = selectedAuthTab == 1,
-                        onClick = { selectedAuthTab = 1; errorMsg = null },
-                        label = { Text(strings.phoneTab, style = MaterialTheme.typography.labelSmall) },
-                        colors = FilterChipDefaults.filterChipColors(selectedContainerColor = NavyPrimary, selectedLabelColor = CrispWhite),
-                        modifier = Modifier.weight(1f).testTag("auth_tab_phone")
-                    )
-                }
-
+                // 2. Real Supabase Email OTP Verification
                 OutlinedTextField(
                     value = fullName,
                     onValueChange = { fullName = it; errorMsg = null },
                     label = { Text(strings.fullNameLabel) },
-                    placeholder = { Text("e.g., Ayesha Khan") },
+                    placeholder = { Text("Enter your name") },
+                    enabled = !isSubmitting,
                     singleLine = true,
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.fillMaxWidth().testTag("auth_name_input")
                 )
 
-                if (selectedAuthTab == 0) {
-                    // 2. Email & Password
-                    OutlinedTextField(
-                        value = email,
-                        onValueChange = { email = it; errorMsg = null },
-                        label = { Text(strings.emailLabel) },
-                        placeholder = { Text("name@example.com") },
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
-                        singleLine = true,
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.fillMaxWidth().testTag("auth_email_input")
-                    )
-                    OutlinedTextField(
-                        value = password,
-                        onValueChange = { password = it; errorMsg = null },
-                        label = { Text(strings.passwordLabel) },
-                        placeholder = { Text("Min 4 characters") },
-                        visualTransformation = PasswordVisualTransformation(),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                        singleLine = true,
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.fillMaxWidth().testTag("auth_password_input")
+                OutlinedTextField(
+                    value = email,
+                    onValueChange = {
+                        email = it
+                        errorMsg = null
+                        if (otpSent) {
+                            otpSent = false
+                            otpCode = ""
+                            statusMsg = null
+                        }
+                    },
+                    label = { Text(strings.emailLabel) },
+                    placeholder = { Text("name@example.com") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+                    enabled = !isSubmitting,
+                    singleLine = true,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth().testTag("auth_email_input")
+                )
+
+                if (otpSent) {
+                    StatusPill(
+                        text = statusMsg ?: strings.otpSentNotice,
+                        containerColor = EmeraldSoft,
+                        contentColor = EmeraldDark,
+                        icon = Icons.Rounded.MarkEmailRead
                     )
 
-                    if (errorMsg != null) {
-                        Text(errorMsg!!, style = MaterialTheme.typography.labelSmall, color = RoseAlert)
-                    }
+                    OutlinedTextField(
+                        value = otpCode,
+                        onValueChange = { otpCode = it; errorMsg = null },
+                        label = { Text(strings.otpLabel) },
+                        placeholder = { Text("Enter code from email") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        enabled = !isSubmitting,
+                        singleLine = true,
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth().testTag("auth_otp_input")
+                    )
+                }
 
+                if (errorMsg != null) {
+                    Text(errorMsg!!, style = MaterialTheme.typography.labelSmall, color = RoseAlert)
+                }
+
+                if (!otpSent) {
                     Button(
                         onClick = {
-                            when (val res = onEmailAuth(fullName, email, password)) {
-                                is PasswordChangeResult.Success -> Unit
-                                is PasswordChangeResult.Error -> errorMsg = res.message
+                            if (isSubmitting) return@Button
+                            scope.launch {
+                                isSubmitting = true
+                                errorMsg = null
+                                when (val res = onSendEmailOtp(fullName, email)) {
+                                    is PasswordChangeResult.Success -> {
+                                        otpSent = true
+                                        statusMsg = res.message
+                                    }
+                                    is PasswordChangeResult.Error -> errorMsg = res.message
+                                }
+                                isSubmitting = false
                             }
                         },
+                        enabled = !isSubmitting,
+                        colors = ButtonDefaults.buttonColors(containerColor = NavyPrimary, contentColor = CrispWhite),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .testTag("auth_send_email_otp_button")
+                    ) {
+                        if (isSubmitting) {
+                            CircularProgressIndicator(
+                                color = CrispWhite,
+                                strokeWidth = 2.dp,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        } else {
+                            Text(strings.loginWithEmailBtn, style = MaterialTheme.typography.labelLarge)
+                        }
+                    }
+                } else {
+                    Button(
+                        onClick = {
+                            if (isSubmitting) return@Button
+                            scope.launch {
+                                isSubmitting = true
+                                errorMsg = null
+                                when (val res = onVerifyEmailOtp(fullName, email, otpCode)) {
+                                    is PasswordChangeResult.Success -> Unit
+                                    is PasswordChangeResult.Error -> errorMsg = res.message
+                                }
+                                isSubmitting = false
+                            }
+                        },
+                        enabled = !isSubmitting,
                         colors = ButtonDefaults.buttonColors(containerColor = NavyPrimary, contentColor = CrispWhite),
                         shape = RoundedCornerShape(12.dp),
                         modifier = Modifier
@@ -746,87 +799,70 @@ fun CustomerAuthModal(
                             .height(48.dp)
                             .testTag("auth_email_submit_button")
                     ) {
-                        Text(strings.loginWithEmailBtn, style = MaterialTheme.typography.labelLarge)
-                    }
-                } else {
-                    // 3. Phone Number + Quick Simulated OTP (e.g. 1234)
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        OutlinedTextField(
-                            value = phone,
-                            onValueChange = { phone = it; errorMsg = null },
-                            label = { Text(strings.phoneLabel) },
-                            placeholder = { Text("+92 300 1234567") },
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
-                            singleLine = true,
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.weight(1f).testTag("auth_phone_input")
-                        )
-                        FilledTonalButton(
-                            onClick = {
-                                if (phone.filter { it.isDigit() }.length >= 7) {
-                                    otpSent = true
-                                    errorMsg = null
-                                } else {
-                                    errorMsg = "Enter a valid phone number first."
-                                }
-                            },
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.height(50.dp).testTag("auth_send_otp_button")
-                        ) {
-                            Text(strings.sendOtpBtn, style = MaterialTheme.typography.labelSmall)
+                        if (isSubmitting) {
+                            CircularProgressIndicator(
+                                color = CrispWhite,
+                                strokeWidth = 2.dp,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        } else {
+                            Text(strings.verifyAndContinueBtn, style = MaterialTheme.typography.labelLarge)
                         }
                     }
 
-                    if (otpSent) {
-                        StatusPill(
-                            text = "Simulated SMS OTP sent: 1234",
-                            containerColor = EmeraldSoft,
-                            contentColor = EmeraldDark,
-                            icon = Icons.Rounded.Sms
-                        )
-                    }
-
-                    OutlinedTextField(
-                        value = otpCode,
-                        onValueChange = { otpCode = it.filter { ch -> ch.isDigit() }; errorMsg = null },
-                        label = { Text(strings.otpLabel) },
-                        placeholder = { Text("1234") },
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        singleLine = true,
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.fillMaxWidth().testTag("auth_otp_input")
-                    )
-
-                    if (errorMsg != null) {
-                        Text(errorMsg!!, style = MaterialTheme.typography.labelSmall, color = RoseAlert)
-                    }
-
-                    Button(
+                    TextButton(
                         onClick = {
-                            when (val res = onPhoneOtpAuth(fullName, phone, otpCode)) {
-                                is PasswordChangeResult.Success -> Unit
-                                is PasswordChangeResult.Error -> errorMsg = res.message
+                            if (isSubmitting) return@TextButton
+                            scope.launch {
+                                isSubmitting = true
+                                errorMsg = null
+                                when (val res = onSendEmailOtp(fullName, email)) {
+                                    is PasswordChangeResult.Success -> statusMsg = res.message
+                                    is PasswordChangeResult.Error -> errorMsg = res.message
+                                }
+                                isSubmitting = false
                             }
                         },
-                        colors = ButtonDefaults.buttonColors(containerColor = NavyPrimary, contentColor = CrispWhite),
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(48.dp)
-                            .testTag("auth_phone_submit_button")
+                        enabled = !isSubmitting,
+                        modifier = Modifier.align(Alignment.End)
                     ) {
-                        Text(strings.verifyAndContinueBtn, style = MaterialTheme.typography.labelLarge)
+                        Text(strings.sendOtpBtn, style = MaterialTheme.typography.labelMedium, color = NavyPrimary)
                     }
+                }
+
+                HorizontalDivider(color = SlateBorder)
+
+                // 3. Continue as Guest (Order without account)
+                OutlinedButton(
+                    onClick = onContinueAsGuest,
+                    enabled = !isSubmitting,
+                    border = BorderStroke(1.dp, SlateBorder),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .testTag("auth_continue_guest_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.PersonOutline,
+                        contentDescription = null,
+                        tint = NavyPrimary,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = strings.continueAsGuestBtn,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = NavyPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
                 }
             }
         },
         confirmButton = {},
         dismissButton = {
-            TextButton(onClick = onDismiss) {
+            TextButton(onClick = onDismiss, enabled = !isSubmitting) {
                 Text(strings.cancelBtn, color = SlateSubtext)
             }
         }

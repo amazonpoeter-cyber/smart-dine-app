@@ -1,5 +1,7 @@
 package com.example.ui.customer
 
+import android.content.Intent
+import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
@@ -21,11 +23,13 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.model.*
+import com.example.ui.components.CustomerAvatar
 import com.example.ui.components.FoodArtwork
 import com.example.ui.components.StatusPill
 import com.example.ui.components.formatRs
@@ -51,11 +55,22 @@ fun CustomerScreen(
         return
     }
 
+    val context = LocalContext.current
     val strings = remember(uiState.appLanguage) { AppStrings.forLanguage(uiState.appLanguage) }
     var showDeliveryCheckout by remember { mutableStateOf(false) }
     var showCustomerAuthModal by remember { mutableStateOf(false) }
     var pendingCheckoutAfterAuth by remember { mutableStateOf(false) }
     var detailMenuItem by remember { mutableStateOf<MenuItem?>(null) }
+
+    LaunchedEffect(uiState.loggedInCustomer) {
+        if (uiState.loggedInCustomer != null && showCustomerAuthModal) {
+            showCustomerAuthModal = false
+            if (pendingCheckoutAfterAuth) {
+                pendingCheckoutAfterAuth = false
+                showDeliveryCheckout = true
+            }
+        }
+    }
 
     BackHandler(enabled = uiState.customerTab != CustomerTab.MENU) {
         viewModel.selectCustomerTab(CustomerTab.MENU)
@@ -97,18 +112,27 @@ fun CustomerScreen(
                                 modifier = Modifier.testTag("delivery_mode_badge")
                             ) {
                                 Row(
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
                                     verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                                 ) {
-                                    Icon(
-                                        imageVector = Icons.Rounded.DeliveryDining,
-                                        contentDescription = null,
-                                        tint = AmberWarm,
-                                        modifier = Modifier.size(16.dp)
-                                    )
+                                    val loggedIn = uiState.loggedInCustomer
+                                    if (loggedIn != null) {
+                                        CustomerAvatar(
+                                            avatarUrl = loggedIn.avatarUrl,
+                                            name = loggedIn.name,
+                                            size = 20.dp
+                                        )
+                                    } else {
+                                        Icon(
+                                            imageVector = Icons.Rounded.DeliveryDining,
+                                            contentDescription = null,
+                                            tint = AmberWarm,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                    }
                                     Text(
-                                        text = uiState.loggedInCustomer?.name ?: strings.homeDeliveryLabel,
+                                        text = loggedIn?.name ?: strings.homeDeliveryLabel,
                                         style = MaterialTheme.typography.labelMedium,
                                         color = CrispWhite,
                                         maxLines = 1,
@@ -331,34 +355,46 @@ fun CustomerScreen(
                 pendingCheckoutAfterAuth = false
             },
             onGoogleSignIn = {
-                viewModel.loginCustomerWithGoogle()
+                val urlRes = viewModel.startGoogleSignIn()
+                val authUrl = urlRes.getOrNull()
+                if (authUrl == null) {
+                    PasswordChangeResult.Error(
+                        urlRes.exceptionOrNull()?.message ?: "Google Sign-In is unavailable right now."
+                    )
+                } else {
+                    val launched = runCatching {
+                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(authUrl)).apply {
+                            addCategory(Intent.CATEGORY_BROWSABLE)
+                        }
+                        context.startActivity(intent)
+                    }
+                    if (launched.isSuccess) {
+                        PasswordChangeResult.Success("Opening Google Sign-In in your browser...")
+                    } else {
+                        PasswordChangeResult.Error("No browser found to complete Google Sign-In.")
+                    }
+                }
+            },
+            onSendEmailOtp = { name, email ->
+                viewModel.sendCustomerEmailOtp(name, email)
+            },
+            onVerifyEmailOtp = { name, email, otpCode ->
+                val res = viewModel.verifyCustomerEmailOtp(name, email, otpCode)
+                if (res is PasswordChangeResult.Success) {
+                    showCustomerAuthModal = false
+                    if (pendingCheckoutAfterAuth) {
+                        pendingCheckoutAfterAuth = false
+                        showDeliveryCheckout = true
+                    }
+                }
+                res
+            },
+            onContinueAsGuest = {
                 showCustomerAuthModal = false
                 if (pendingCheckoutAfterAuth) {
                     pendingCheckoutAfterAuth = false
                     showDeliveryCheckout = true
                 }
-            },
-            onEmailAuth = { name, email, pass ->
-                val res = viewModel.loginOrSignUpCustomerWithEmail(name, email, pass)
-                if (res is PasswordChangeResult.Success) {
-                    showCustomerAuthModal = false
-                    if (pendingCheckoutAfterAuth) {
-                        pendingCheckoutAfterAuth = false
-                        showDeliveryCheckout = true
-                    }
-                }
-                res
-            },
-            onPhoneOtpAuth = { name, phone, otp ->
-                val res = viewModel.loginCustomerWithPhoneOtp(name, phone, otp)
-                if (res is PasswordChangeResult.Success) {
-                    showCustomerAuthModal = false
-                    if (pendingCheckoutAfterAuth) {
-                        pendingCheckoutAfterAuth = false
-                        showDeliveryCheckout = true
-                    }
-                }
-                res
             }
         )
     }

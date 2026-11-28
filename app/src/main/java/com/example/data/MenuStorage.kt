@@ -20,12 +20,6 @@ import com.example.util.WeekdaySlot
 import org.json.JSONArray
 import org.json.JSONObject
 
-data class RegisteredCustomerAccount(
-    val email: String,
-    val name: String,
-    val passwordHash: String
-)
-
 interface MenuStorage {
     fun loadMenuItems(): List<MenuItem>?
     fun saveMenuItems(items: List<MenuItem>)
@@ -38,8 +32,8 @@ interface CredentialAndRosterStorage {
     fun saveStaff(staff: List<StaffMember>)
     fun loadLoggedInCustomer(): CustomerProfile? = null
     fun saveLoggedInCustomer(profile: CustomerProfile?) {}
-    fun loadCustomerEmailAccounts(): List<RegisteredCustomerAccount> = emptyList()
-    fun saveCustomerEmailAccounts(accounts: List<RegisteredCustomerAccount>) {}
+    fun loadPendingOAuthVerifier(): String? = null
+    fun savePendingOAuthVerifier(verifier: String?) {}
     fun loadDeliveryOrders(): List<KitchenOrder>? = null
     fun saveDeliveryOrders(orders: List<KitchenOrder>) {}
     fun loadAppLanguage(): AppLanguage? = null
@@ -59,7 +53,7 @@ class InMemoryCredentialStorage(
     private var adminHash: String? = null,
     private var staffList: List<StaffMember>? = null,
     private var loggedInCustomer: CustomerProfile? = null,
-    private var customerAccounts: List<RegisteredCustomerAccount> = emptyList(),
+    private var pendingOAuthVerifier: String? = null,
     private var deliveryOrders: List<KitchenOrder>? = null,
     private var appLanguage: AppLanguage? = null
 ) : CredentialAndRosterStorage {
@@ -75,9 +69,9 @@ class InMemoryCredentialStorage(
     override fun saveLoggedInCustomer(profile: CustomerProfile?) {
         loggedInCustomer = profile
     }
-    override fun loadCustomerEmailAccounts(): List<RegisteredCustomerAccount> = customerAccounts
-    override fun saveCustomerEmailAccounts(accounts: List<RegisteredCustomerAccount>) {
-        customerAccounts = accounts
+    override fun loadPendingOAuthVerifier(): String? = pendingOAuthVerifier
+    override fun savePendingOAuthVerifier(verifier: String?) {
+        pendingOAuthVerifier = verifier
     }
     override fun loadDeliveryOrders(): List<KitchenOrder>? = deliveryOrders
     override fun saveDeliveryOrders(orders: List<KitchenOrder>) {
@@ -240,12 +234,13 @@ class SharedPreferencesMenuStorage(context: Context) : MenuStorage, CredentialAn
         return runCatching {
             val obj = JSONObject(raw)
             val provider = runCatching {
-                CustomerAuthProvider.valueOf(obj.optString("provider", CustomerAuthProvider.GOOGLE.name))
-            }.getOrDefault(CustomerAuthProvider.GOOGLE)
+                CustomerAuthProvider.valueOf(obj.optString("provider", CustomerAuthProvider.EMAIL.name))
+            }.getOrDefault(CustomerAuthProvider.EMAIL)
             CustomerProfile(
                 id = obj.getString("id"),
                 name = obj.getString("name"),
                 email = obj.optString("email", ""),
+                avatarUrl = sanitizeImageUrl(obj.optString("avatarUrl", "")),
                 phone = obj.optString("phone", ""),
                 provider = provider
             )
@@ -261,42 +256,22 @@ class SharedPreferencesMenuStorage(context: Context) : MenuStorage, CredentialAn
             put("id", profile.id)
             put("name", profile.name)
             put("email", profile.email)
+            put("avatarUrl", sanitizeImageUrl(profile.avatarUrl))
             put("phone", profile.phone)
             put("provider", profile.provider.name)
         }
         prefs.edit().putString(KEY_LOGGED_IN_CUSTOMER, obj.toString()).apply()
     }
 
-    override fun loadCustomerEmailAccounts(): List<RegisteredCustomerAccount> {
-        val raw = prefs.getString(KEY_CUSTOMER_EMAIL_ACCOUNTS, null) ?: return emptyList()
-        return runCatching {
-            val array = JSONArray(raw)
-            buildList {
-                for (i in 0 until array.length()) {
-                    val obj = array.getJSONObject(i)
-                    add(
-                        RegisteredCustomerAccount(
-                            email = obj.getString("email"),
-                            name = obj.optString("name", "Smart Dine Guest"),
-                            passwordHash = obj.getString("passwordHash")
-                        )
-                    )
-                }
-            }
-        }.getOrDefault(emptyList())
-    }
+    override fun loadPendingOAuthVerifier(): String? =
+        prefs.getString(KEY_PENDING_OAUTH_VERIFIER, null)?.takeIf { it.isNotBlank() }
 
-    override fun saveCustomerEmailAccounts(accounts: List<RegisteredCustomerAccount>) {
-        val array = JSONArray()
-        accounts.forEach { acct ->
-            val obj = JSONObject().apply {
-                put("email", acct.email)
-                put("name", acct.name)
-                put("passwordHash", acct.passwordHash)
-            }
-            array.put(obj)
+    override fun savePendingOAuthVerifier(verifier: String?) {
+        if (verifier.isNullOrBlank()) {
+            prefs.edit().remove(KEY_PENDING_OAUTH_VERIFIER).apply()
+        } else {
+            prefs.edit().putString(KEY_PENDING_OAUTH_VERIFIER, verifier).apply()
         }
-        prefs.edit().putString(KEY_CUSTOMER_EMAIL_ACCOUNTS, array.toString()).apply()
     }
 
     override fun loadDeliveryOrders(): List<KitchenOrder>? {
@@ -426,7 +401,7 @@ class SharedPreferencesMenuStorage(context: Context) : MenuStorage, CredentialAn
         private const val KEY_ADMIN_PASS_HASH = "admin_password_sha256_v1"
         private const val KEY_STAFF_LIST = "staff_roster_json_v1"
         private const val KEY_LOGGED_IN_CUSTOMER = "logged_in_customer_v1"
-        private const val KEY_CUSTOMER_EMAIL_ACCOUNTS = "customer_email_accounts_v1"
+        private const val KEY_PENDING_OAUTH_VERIFIER = "pending_oauth_verifier_v1"
         private const val KEY_DELIVERY_ORDERS = "delivery_orders_history_v1"
         private const val KEY_APP_LANGUAGE = "app_language_v1"
 

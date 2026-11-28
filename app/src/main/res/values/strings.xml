@@ -8,6 +8,5 @@
     <string name="place_order">Place Order</string>
     <string name="payment_successful">Payment Successful</string>
     <string name="admin_login">Admin Login</string>
-    <string name="demo_password_hint">Demo password: admin123</string>
     <string name="logout_customer_view">Logout / Customer View</string>
 </resources>

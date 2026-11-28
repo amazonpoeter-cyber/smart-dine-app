@@ -1,6 +1,7 @@
 package com.example.data
 
 import com.example.data.supabase.NoOpSupabaseService
+import com.example.data.supabase.SupabaseAuthResult
 import com.example.data.supabase.SupabaseRealtimeEvent
 import com.example.data.supabase.SupabaseService
 import com.example.model.AttendanceRecord
@@ -43,6 +44,40 @@ class SmartDineRepository(
     fun stopRealtimeSync() {
         supabaseService.stopRealtimeSync()
     }
+
+    fun refreshRealtimeAuth() {
+        supabaseService.refreshRealtimeAuth()
+    }
+
+    suspend fun signInAdmin(email: String, password: String): SupabaseAuthResult =
+        supabaseService.signInAdmin(email, password)
+
+    fun beginGoogleOAuth(onPersistVerifier: (String) -> Unit): Result<String> =
+        supabaseService.beginGoogleOAuth(onPersistVerifier)
+
+    suspend fun completeGoogleOAuth(
+        code: String?,
+        accessTokenFromFragment: String?,
+        errorMessage: String?,
+        persistedVerifier: String?
+    ): SupabaseAuthResult =
+        supabaseService.completeGoogleOAuth(code, accessTokenFromFragment, errorMessage, persistedVerifier)
+
+    suspend fun sendEmailOtp(email: String, fullName: String = ""): Result<Unit> =
+        supabaseService.sendEmailOtp(email, fullName)
+
+    suspend fun verifyEmailOtp(email: String, token: String): SupabaseAuthResult =
+        supabaseService.verifyEmailOtp(email, token)
+
+    suspend fun updateAdminPassword(newPassword: String): Result<Unit> =
+        supabaseService.updateUserPassword(newPassword)
+
+    suspend fun signOutAuth() {
+        supabaseService.signOutAuth()
+    }
+
+    suspend fun authenticateEmployee(cnic: String, passwordHash: String): Result<StaffMember?> =
+        supabaseService.authenticateEmployee(cnic, passwordHash)
 
     suspend fun syncInitialDataOrSeed(
         localMenu: List<MenuItem>,
@@ -93,76 +128,30 @@ class SmartDineRepository(
         ).any { it }
 
         val resolvedMenu = menuRes.getOrNull()?.let { remote ->
-            if (remote.isEmpty() && localMenu.isNotEmpty()) {
-                supabaseService.upsertMenuItems(localMenu)
-                localMenu
-            } else {
+            if (remote.isNotEmpty()) {
                 menuStorage.saveMenuItems(remote)
                 remote
+            } else {
+                localMenu
             }
         } ?: localMenu
 
         val resolvedOrders = ordersRes.getOrNull()?.let { remote ->
-            if (remote.isEmpty() && localOrders.isNotEmpty()) {
-                supabaseService.upsertOrders(localOrders)
-                localOrders
-            } else {
-                val merged = (remote + localOrders.filter { local ->
-                    remote.none { it.orderNumber == local.orderNumber }
-                }).sortedByDescending { it.orderNumber }
-                credentialStorage.saveDeliveryOrders(merged)
-                merged
-            }
+            val sorted = remote.sortedByDescending { it.orderNumber }
+            credentialStorage.saveDeliveryOrders(sorted)
+            sorted
         } ?: localOrders
 
-        val resolvedReviews = reviewsRes.getOrNull()?.let { remote ->
-            if (remote.isEmpty() && localReviews.isNotEmpty()) {
-                supabaseService.upsertReviews(localReviews)
-                localReviews
-            } else {
-                remote
-            }
-        } ?: localReviews
+        val resolvedReviews = reviewsRes.getOrNull() ?: localReviews
 
         val resolvedStaff = staffRes.getOrNull()?.let { remote ->
-            if (remote.isEmpty() && localStaff.isNotEmpty()) {
-                supabaseService.upsertStaffList(localStaff)
-                localStaff
-            } else {
-                credentialStorage.saveStaff(remote)
-                remote
-            }
+            credentialStorage.saveStaff(remote)
+            remote
         } ?: localStaff
 
-        val resolvedAttendance = attendanceRes.getOrNull()?.let { remote ->
-            if (remote.isEmpty() && localAttendance.isNotEmpty()) {
-                supabaseService.upsertAttendanceRecords(localAttendance)
-                localAttendance
-            } else {
-                remote
-            }
-        } ?: localAttendance
-
-        val resolvedAlerts = alertsRes.getOrNull()?.let { remote ->
-            if (remote.isEmpty() && localAlerts.isNotEmpty()) {
-                supabaseService.upsertAlerts(localAlerts)
-                localAlerts
-            } else {
-                remote
-            }
-        } ?: localAlerts
-
-        val resolvedSales = salesRes.getOrNull()?.let { remote ->
-            if (remote.isEmpty() && localSales.isNotEmpty()) {
-                supabaseService.upsertSalesRecords(localSales)
-                localSales
-            } else {
-                val mergedSales = (remote + localSales.filter { local ->
-                    remote.none { it.dateIso == local.dateIso }
-                }).sortedByDescending { it.dateIso }
-                mergedSales
-            }
-        } ?: localSales
+        val resolvedAttendance = attendanceRes.getOrNull() ?: localAttendance
+        val resolvedAlerts = alertsRes.getOrNull() ?: localAlerts
+        val resolvedSales = salesRes.getOrNull()?.sortedByDescending { it.dateIso } ?: localSales
 
         RemoteSyncSnapshot(
             menuItems = resolvedMenu,
@@ -183,7 +172,7 @@ class SmartDineRepository(
     }
 
     suspend fun refreshOrders(): List<KitchenOrder>? {
-        val fetched = supabaseService.fetchOrders().getOrNull() ?: return null
+        val fetched = supabaseService.fetchOrders().getOrNull()?.sortedByDescending { it.orderNumber } ?: return null
         credentialStorage.saveDeliveryOrders(fetched)
         return fetched
     }
@@ -201,7 +190,8 @@ class SmartDineRepository(
 
     suspend fun refreshAlerts(): List<WhatsAppAlert>? = supabaseService.fetchAlerts().getOrNull()
 
-    suspend fun refreshSales(): List<DailySalesRecord>? = supabaseService.fetchSalesRecords().getOrNull()
+    suspend fun refreshSales(): List<DailySalesRecord>? =
+        supabaseService.fetchSalesRecords().getOrNull()?.sortedByDescending { it.dateIso }
 
     suspend fun syncUpsertMenuItem(item: MenuItem): Result<Unit> =
         supabaseService.upsertMenuItem(item)

@@ -61,6 +61,7 @@ import com.example.util.DateUtils
 import com.example.util.LocalizedStrings
 import com.example.viewmodel.EmployeeLoginResult
 import com.example.viewmodel.PasswordChangeResult
+import kotlinx.coroutines.launch
 import java.text.NumberFormat
 import java.util.Locale
 
@@ -93,6 +94,70 @@ fun SmartDineBrandLogo(
             modifier = Modifier.fillMaxSize(),
             contentScale = ContentScale.Fit
         )
+    }
+}
+
+@Composable
+fun CustomerAvatar(
+    avatarUrl: String,
+    name: String,
+    modifier: Modifier = Modifier,
+    size: Dp = 36.dp
+) {
+    val cleanUrl = avatarUrl.trim()
+    val hasValidUrl = cleanUrl.startsWith("https://", ignoreCase = true) ||
+        cleanUrl.startsWith("http://", ignoreCase = true)
+    val initial = name.trim().firstOrNull()?.uppercaseChar()?.toString() ?: ""
+
+    Box(
+        modifier = modifier
+            .size(size)
+            .clip(CircleShape)
+            .background(NavyMuted.copy(alpha = 0.2f)),
+        contentAlignment = Alignment.Center
+    ) {
+        if (hasValidUrl) {
+            SubcomposeAsyncImage(
+                model = cleanUrl,
+                contentDescription = "$name avatar",
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize(),
+                loading = {
+                    CustomerAvatarFallback(initial = initial, size = size)
+                },
+                error = {
+                    CustomerAvatarFallback(initial = initial, size = size)
+                }
+            )
+        } else {
+            CustomerAvatarFallback(initial = initial, size = size)
+        }
+    }
+}
+
+@Composable
+private fun CustomerAvatarFallback(initial: String, size: Dp) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(NavyPrimary),
+        contentAlignment = Alignment.Center
+    ) {
+        if (initial.isNotBlank()) {
+            Text(
+                text = initial,
+                style = MaterialTheme.typography.labelMedium,
+                color = CrispWhite,
+                fontWeight = FontWeight.Bold
+            )
+        } else {
+            Icon(
+                imageVector = Icons.Rounded.Person,
+                contentDescription = null,
+                tint = CrispWhite,
+                modifier = Modifier.size(size * 0.58f)
+            )
+        }
     }
 }
 
@@ -331,11 +396,22 @@ fun CustomerSlideDrawer(
                                     ) {
                                         Row(
                                             modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            horizontalArrangement = Arrangement.spacedBy(10.dp),
                                             verticalAlignment = Alignment.CenterVertically
                                         ) {
+                                            CustomerAvatar(
+                                                avatarUrl = loggedInCustomer.avatarUrl,
+                                                name = loggedInCustomer.name,
+                                                size = 38.dp
+                                            )
                                             Column(modifier = Modifier.weight(1f)) {
-                                                Text(loggedInCustomer.name, style = MaterialTheme.typography.titleSmall, color = NavyPrimary)
+                                                Text(
+                                                    text = loggedInCustomer.name,
+                                                    style = MaterialTheme.typography.titleSmall,
+                                                    color = NavyPrimary,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
                                                 Text(
                                                     text = loggedInCustomer.email.ifBlank { loggedInCustomer.phone },
                                                     style = MaterialTheme.typography.labelSmall,
@@ -791,15 +867,17 @@ fun ChangePasswordDialog(
     confirmLabel: String,
     isPinKeyboard: Boolean,
     onDismiss: () -> Unit,
-    onSubmit: (oldVal: String, newVal: String, confirmVal: String) -> PasswordChangeResult
+    onSubmit: suspend (oldVal: String, newVal: String, confirmVal: String) -> PasswordChangeResult
 ) {
     var oldVal by remember { mutableStateOf("") }
     var newVal by remember { mutableStateOf("") }
     var confirmVal by remember { mutableStateOf("") }
     var errorMsg by remember { mutableStateOf<String?>(null) }
+    var isSubmitting by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
 
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = { if (!isSubmitting) onDismiss() },
         containerColor = CrispWhite,
         icon = {
             Box(
@@ -822,6 +900,7 @@ fun ChangePasswordDialog(
                     label = { Text(oldLabel) },
                     visualTransformation = PasswordVisualTransformation(),
                     keyboardOptions = KeyboardOptions(keyboardType = kbType),
+                    enabled = !isSubmitting,
                     singleLine = true,
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.fillMaxWidth().testTag("change_pwd_old_input")
@@ -832,6 +911,7 @@ fun ChangePasswordDialog(
                     label = { Text(newLabel) },
                     visualTransformation = PasswordVisualTransformation(),
                     keyboardOptions = KeyboardOptions(keyboardType = kbType),
+                    enabled = !isSubmitting,
                     singleLine = true,
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.fillMaxWidth().testTag("change_pwd_new_input")
@@ -842,6 +922,7 @@ fun ChangePasswordDialog(
                     label = { Text(confirmLabel) },
                     visualTransformation = PasswordVisualTransformation(),
                     keyboardOptions = KeyboardOptions(keyboardType = kbType),
+                    enabled = !isSubmitting,
                     singleLine = true,
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.fillMaxWidth().testTag("change_pwd_confirm_input")
@@ -854,20 +935,36 @@ fun ChangePasswordDialog(
         confirmButton = {
             Button(
                 onClick = {
-                    when (val result = onSubmit(oldVal, newVal, confirmVal)) {
-                        is PasswordChangeResult.Success -> onDismiss()
-                        is PasswordChangeResult.Error -> errorMsg = result.message
+                    if (isSubmitting) return@Button
+                    scope.launch {
+                        isSubmitting = true
+                        when (val result = onSubmit(oldVal, newVal, confirmVal)) {
+                            is PasswordChangeResult.Success -> onDismiss()
+                            is PasswordChangeResult.Error -> errorMsg = result.message
+                        }
+                        isSubmitting = false
                     }
                 },
+                enabled = !isSubmitting,
                 colors = ButtonDefaults.buttonColors(containerColor = NavyPrimary, contentColor = CrispWhite),
                 shape = RoundedCornerShape(12.dp),
                 modifier = Modifier.testTag("change_pwd_submit_button")
             ) {
-                Text("Update")
+                if (isSubmitting) {
+                    CircularProgressIndicator(
+                        color = CrispWhite,
+                        strokeWidth = 2.dp,
+                        modifier = Modifier.size(18.dp)
+                    )
+                } else {
+                    Text("Update")
+                }
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel", color = SlateSubtext) }
+            TextButton(onClick = onDismiss, enabled = !isSubmitting) {
+                Text("Cancel", color = SlateSubtext)
+            }
         }
     )
 }
@@ -875,22 +972,29 @@ fun ChangePasswordDialog(
 @Composable
 fun EmployeeLoginDialog(
     onDismiss: () -> Unit,
-    onLoginWithCnic: (cnicInput: String, passwordInput: String) -> EmployeeLoginResult
+    onLoginWithCnic: suspend (cnicInput: String, passwordInput: String) -> EmployeeLoginResult
 ) {
     var cnicInput by remember { mutableStateOf("") }
     var passwordInput by remember { mutableStateOf("") }
     var showPassword by remember { mutableStateOf(false) }
     var errorMsg by remember { mutableStateOf<String?>(null) }
+    var isSubmitting by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
 
     fun submitLogin() {
-        when (val result = onLoginWithCnic(cnicInput, passwordInput)) {
-            is EmployeeLoginResult.Success -> onDismiss()
-            is EmployeeLoginResult.Error -> errorMsg = result.message
+        if (isSubmitting) return
+        scope.launch {
+            isSubmitting = true
+            when (val result = onLoginWithCnic(cnicInput, passwordInput)) {
+                is EmployeeLoginResult.Success -> onDismiss()
+                is EmployeeLoginResult.Error -> errorMsg = result.message
+            }
+            isSubmitting = false
         }
     }
 
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = { if (!isSubmitting) onDismiss() },
         containerColor = CrispWhite,
         icon = {
             SmartDineBrandLogo(size = 48.dp)
@@ -910,10 +1014,11 @@ fun EmployeeLoginDialog(
                     value = cnicInput,
                     onValueChange = { cnicInput = it; errorMsg = null },
                     label = { Text("CNIC Number (Login ID)") },
-                    placeholder = { Text("34601-1234567-1") },
+                    placeholder = { Text("XXXXX-XXXXXXX-X") },
                     leadingIcon = { Icon(Icons.Rounded.CreditCard, contentDescription = null, tint = SlateSubtext) },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii, imeAction = ImeAction.Next),
                     isError = errorMsg != null,
+                    enabled = !isSubmitting,
                     singleLine = true,
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.fillMaxWidth().testTag("employee_cnic_input")
@@ -923,10 +1028,10 @@ fun EmployeeLoginDialog(
                     value = passwordInput,
                     onValueChange = { passwordInput = it; errorMsg = null },
                     label = { Text("Password") },
-                    placeholder = { Text("Enter alphanumeric password") },
+                    placeholder = { Text("Enter password") },
                     leadingIcon = { Icon(Icons.Rounded.Lock, contentDescription = null, tint = SlateSubtext) },
                     trailingIcon = {
-                        IconButton(onClick = { showPassword = !showPassword }) {
+                        IconButton(onClick = { showPassword = !showPassword }, enabled = !isSubmitting) {
                             Icon(
                                 imageVector = if (showPassword) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility,
                                 contentDescription = if (showPassword) "Hide password" else "Show password",
@@ -938,6 +1043,7 @@ fun EmployeeLoginDialog(
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Done),
                     keyboardActions = KeyboardActions(onDone = { submitLogin() }),
                     isError = errorMsg != null,
+                    enabled = !isSubmitting,
                     singleLine = true,
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.fillMaxWidth().testTag("employee_password_input")
@@ -946,53 +1052,31 @@ fun EmployeeLoginDialog(
                 if (errorMsg != null) {
                     Text(errorMsg!!, style = MaterialTheme.typography.labelSmall, color = RoseAlert)
                 }
-
-                Surface(
-                    color = SlateSurfaceVariant,
-                    shape = RoundedCornerShape(10.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(
-                        modifier = Modifier.padding(10.dp),
-                        verticalArrangement = Arrangement.spacedBy(3.dp)
-                    ) {
-                        Text(
-                            text = "Demo Staff Logins:",
-                            style = MaterialTheme.typography.labelSmall,
-                            fontWeight = FontWeight.Bold,
-                            color = NavyPrimary
-                        )
-                        Text(
-                            text = "Chef Tariq: 34601-1111111-1 / chef123",
-                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMono),
-                            color = NavyMuted
-                        )
-                        Text(
-                            text = "Rider Bilal: 34601-2222222-2 / rider123",
-                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMono),
-                            color = NavyMuted
-                        )
-                        Text(
-                            text = "Floor Host: 34601-4444444-4 / staff123",
-                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMono),
-                            color = NavyMuted
-                        )
-                    }
-                }
             }
         },
         confirmButton = {
             Button(
                 onClick = { submitLogin() },
+                enabled = !isSubmitting,
                 colors = ButtonDefaults.buttonColors(containerColor = NavyPrimary, contentColor = CrispWhite),
                 shape = RoundedCornerShape(12.dp),
                 modifier = Modifier.testTag("employee_checkin_submit_button")
             ) {
-                Text("Login to Portal")
+                if (isSubmitting) {
+                    CircularProgressIndicator(
+                        color = CrispWhite,
+                        strokeWidth = 2.dp,
+                        modifier = Modifier.size(18.dp)
+                    )
+                } else {
+                    Text("Login to Portal")
+                }
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel", color = SlateSubtext) }
+            TextButton(onClick = onDismiss, enabled = !isSubmitting) {
+                Text("Cancel", color = SlateSubtext)
+            }
         }
     )
 }
@@ -1000,24 +1084,29 @@ fun EmployeeLoginDialog(
 @Composable
 fun AdminLoginDialog(
     onDismiss: () -> Unit,
-    onLoginAttempt: (username: String, password: String) -> Boolean
+    onLoginAttempt: suspend (email: String, password: String) -> PasswordChangeResult
 ) {
-    var username by remember { mutableStateOf("admin") }
+    var email by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var showPassword by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
+    var isSubmitting by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
 
     fun submit() {
-        val ok = onLoginAttempt(username, password)
-        if (ok) {
-            onDismiss()
-        } else {
-            errorMessage = "Incorrect password. Please try again."
+        if (isSubmitting) return
+        scope.launch {
+            isSubmitting = true
+            when (val result = onLoginAttempt(email, password)) {
+                is PasswordChangeResult.Success -> onDismiss()
+                is PasswordChangeResult.Error -> errorMessage = result.message
+            }
+            isSubmitting = false
         }
     }
 
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = { if (!isSubmitting) onDismiss() },
         containerColor = CrispWhite,
         icon = {
             SmartDineBrandLogo(size = 48.dp)
@@ -1032,21 +1121,28 @@ fun AdminLoginDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(
-                    text = "Sign in to access Owner Dashboard, Multi-Channel Sales Analytics, Staff Roster, Orders, and Menu Management.",
+                    text = "Sign in with your verified Admin account to access Owner Dashboard, Sales Analytics, Staff Roster, and Menu Management.",
                     style = MaterialTheme.typography.bodySmall,
                     color = SlateSubtext
                 )
 
                 OutlinedTextField(
-                    value = username,
+                    value = email,
                     onValueChange = {
-                        username = it
+                        email = it
                         errorMessage = null
                     },
-                    label = { Text("Username") },
+                    label = { Text("Admin Email") },
+                    placeholder = { Text("Enter admin email") },
                     leadingIcon = {
-                        Icon(Icons.Rounded.Person, contentDescription = null, tint = SlateSubtext)
+                        Icon(Icons.Rounded.Email, contentDescription = null, tint = SlateSubtext)
                     },
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.Email,
+                        imeAction = ImeAction.Next
+                    ),
+                    isError = errorMessage != null,
+                    enabled = !isSubmitting,
                     singleLine = true,
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier
@@ -1060,12 +1156,13 @@ fun AdminLoginDialog(
                         password = it
                         errorMessage = null
                     },
-                    label = { Text("Password / PIN") },
+                    label = { Text("Password") },
+                    placeholder = { Text("Enter password") },
                     leadingIcon = {
                         Icon(Icons.Rounded.Lock, contentDescription = null, tint = SlateSubtext)
                     },
                     trailingIcon = {
-                        IconButton(onClick = { showPassword = !showPassword }) {
+                        IconButton(onClick = { showPassword = !showPassword }, enabled = !isSubmitting) {
                             Icon(
                                 imageVector = if (showPassword) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility,
                                 contentDescription = if (showPassword) "Hide password" else "Show password",
@@ -1080,6 +1177,7 @@ fun AdminLoginDialog(
                     ),
                     keyboardActions = KeyboardActions(onDone = { submit() }),
                     isError = errorMessage != null,
+                    enabled = !isSubmitting,
                     singleLine = true,
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier
@@ -1094,46 +1192,31 @@ fun AdminLoginDialog(
                         color = RoseAlert
                     )
                 }
-
-                Surface(
-                    color = SlateSurfaceVariant,
-                    shape = RoundedCornerShape(10.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.Info,
-                            contentDescription = null,
-                            tint = NavyMuted,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Text(
-                            text = stringResource(R.string.demo_password_hint),
-                            style = MaterialTheme.typography.labelMedium.copy(fontFamily = JetBrainsMono),
-                            color = NavyPrimary
-                        )
-                    }
-                }
             }
         },
         confirmButton = {
             Button(
                 onClick = { submit() },
+                enabled = !isSubmitting,
                 colors = ButtonDefaults.buttonColors(containerColor = NavyPrimary, contentColor = CrispWhite),
                 shape = RoundedCornerShape(12.dp),
                 modifier = Modifier
                     .height(44.dp)
                     .testTag("admin_login_submit_button")
             ) {
-                Text("Unlock Panel")
+                if (isSubmitting) {
+                    CircularProgressIndicator(
+                        color = CrispWhite,
+                        strokeWidth = 2.dp,
+                        modifier = Modifier.size(18.dp)
+                    )
+                } else {
+                    Text("Sign In")
+                }
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) {
+            TextButton(onClick = onDismiss, enabled = !isSubmitting) {
                 Text("Cancel", color = SlateSubtext)
             }
         }
@@ -1234,181 +1317,6 @@ private fun PresetFoodArtwork(
             )
         }
     }
-}
-
-@Composable
-fun KioskActivationDialog(
-    strings: LocalizedStrings,
-    onDismiss: () -> Unit,
-    onActivate: (kioskId: String, password: String) -> PasswordChangeResult
-) {
-    var kioskId by remember { mutableStateOf("") }
-    var password by remember { mutableStateOf("") }
-    var showPassword by remember { mutableStateOf(false) }
-    var errorMsg by remember { mutableStateOf<String?>(null) }
-
-    fun submit() {
-        when (val res = onActivate(kioskId, password)) {
-            is PasswordChangeResult.Success -> onDismiss()
-            is PasswordChangeResult.Error -> errorMsg = res.message
-        }
-    }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        containerColor = CrispWhite,
-        icon = {
-            SmartDineBrandLogo(size = 48.dp)
-        },
-        title = {
-            Text(strings.kioskActivationTitle, style = MaterialTheme.typography.titleLarge, color = NavyPrimary)
-        },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text(strings.kioskActivationSubtitle, style = MaterialTheme.typography.bodySmall, color = SlateSubtext)
-                OutlinedTextField(
-                    value = kioskId,
-                    onValueChange = { kioskId = it; errorMsg = null },
-                    label = { Text(strings.kioskIdLabel) },
-                    placeholder = { Text("kiosk01") },
-                    leadingIcon = { Icon(Icons.Rounded.TabletAndroid, contentDescription = null, tint = SlateSubtext) },
-                    singleLine = true,
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.fillMaxWidth().testTag("kiosk_id_input")
-                )
-                OutlinedTextField(
-                    value = password,
-                    onValueChange = { password = it; errorMsg = null },
-                    label = { Text(strings.kioskPasswordLabel) },
-                    placeholder = { Text("Enter Kiosk password") },
-                    leadingIcon = { Icon(Icons.Rounded.Lock, contentDescription = null, tint = SlateSubtext) },
-                    trailingIcon = {
-                        IconButton(onClick = { showPassword = !showPassword }) {
-                            Icon(
-                                imageVector = if (showPassword) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility,
-                                contentDescription = if (showPassword) "Hide password" else "Show password",
-                                tint = SlateSubtext
-                            )
-                        }
-                    },
-                    visualTransformation = if (showPassword) VisualTransformation.None else PasswordVisualTransformation(),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Done),
-                    keyboardActions = KeyboardActions(onDone = { submit() }),
-                    isError = errorMsg != null,
-                    singleLine = true,
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.fillMaxWidth().testTag("kiosk_password_input")
-                )
-                if (errorMsg != null) {
-                    Text(errorMsg!!, style = MaterialTheme.typography.labelSmall, color = RoseAlert)
-                }
-                Surface(
-                    color = SlateSurfaceVariant,
-                    shape = RoundedCornerShape(10.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Icon(Icons.Rounded.Info, contentDescription = null, tint = NavyMuted, modifier = Modifier.size(16.dp))
-                        Text(
-                            text = "Demo: Kiosk ID: kiosk01 • Password: kiosk123",
-                            style = MaterialTheme.typography.labelMedium.copy(fontFamily = JetBrainsMono),
-                            color = NavyPrimary
-                        )
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            Button(
-                onClick = { submit() },
-                colors = ButtonDefaults.buttonColors(containerColor = NavyPrimary, contentColor = CrispWhite),
-                shape = RoundedCornerShape(12.dp),
-                modifier = Modifier.height(48.dp).testTag("kiosk_activate_submit_button")
-            ) {
-                Text(strings.unlockKioskBtn)
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text(strings.cancelBtn, color = SlateSubtext) }
-        }
-    )
-}
-
-@Composable
-fun KioskExitDialog(
-    strings: LocalizedStrings,
-    onDismiss: () -> Unit,
-    onExit: (password: String) -> PasswordChangeResult
-) {
-    var password by remember { mutableStateOf("") }
-    var showPassword by remember { mutableStateOf(false) }
-    var errorMsg by remember { mutableStateOf<String?>(null) }
-
-    fun submit() {
-        when (val res = onExit(password)) {
-            is PasswordChangeResult.Success -> onDismiss()
-            is PasswordChangeResult.Error -> errorMsg = res.message
-        }
-    }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        containerColor = CrispWhite,
-        icon = {
-            SmartDineBrandLogo(size = 48.dp)
-        },
-        title = {
-            Text(strings.kioskExitTitle, style = MaterialTheme.typography.titleLarge, color = NavyPrimary)
-        },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text(strings.kioskExitSubtitle, style = MaterialTheme.typography.bodySmall, color = SlateSubtext)
-                OutlinedTextField(
-                    value = password,
-                    onValueChange = { password = it; errorMsg = null },
-                    label = { Text(strings.kioskPasswordLabel) },
-                    placeholder = { Text("kiosk123 or Admin password") },
-                    leadingIcon = { Icon(Icons.Rounded.Lock, contentDescription = null, tint = SlateSubtext) },
-                    trailingIcon = {
-                        IconButton(onClick = { showPassword = !showPassword }) {
-                            Icon(
-                                imageVector = if (showPassword) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility,
-                                contentDescription = if (showPassword) "Hide password" else "Show password",
-                                tint = SlateSubtext
-                            )
-                        }
-                    },
-                    visualTransformation = if (showPassword) VisualTransformation.None else PasswordVisualTransformation(),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Done),
-                    keyboardActions = KeyboardActions(onDone = { submit() }),
-                    isError = errorMsg != null,
-                    singleLine = true,
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.fillMaxWidth().testTag("kiosk_exit_password_input")
-                )
-                if (errorMsg != null) {
-                    Text(errorMsg!!, style = MaterialTheme.typography.labelSmall, color = RoseAlert)
-                }
-            }
-        },
-        confirmButton = {
-            Button(
-                onClick = { submit() },
-                colors = ButtonDefaults.buttonColors(containerColor = NavyPrimary, contentColor = CrispWhite),
-                shape = RoundedCornerShape(12.dp),
-                modifier = Modifier.height(48.dp).testTag("kiosk_exit_submit_button")
-            ) {
-                Text(strings.exitKioskBtn)
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text(strings.cancelBtn, color = SlateSubtext) }
-        }
-    )
 }
 
 @Composable

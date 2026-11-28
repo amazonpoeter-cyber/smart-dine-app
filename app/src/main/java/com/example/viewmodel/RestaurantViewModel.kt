@@ -7,10 +7,11 @@ import com.example.data.CredentialAndRosterStorage
 import com.example.data.InMemoryCredentialStorage
 import com.example.data.InMemoryMenuStorage
 import com.example.data.MenuStorage
-import com.example.data.RegisteredCustomerAccount
 import com.example.data.SharedPreferencesMenuStorage
 import com.example.data.SmartDineRepository
 import com.example.data.supabase.NoOpSupabaseService
+import com.example.data.supabase.SupabaseAuthResult
+import com.example.data.supabase.SupabaseAuthSession
 import com.example.data.supabase.SupabaseClient
 import com.example.data.supabase.SupabaseRealtimeEvent
 import com.example.data.supabase.SupabaseService
@@ -18,6 +19,8 @@ import com.example.data.supabase.SupabaseSyncStatus
 import com.example.model.*
 import com.example.util.DateUtils
 import com.example.util.WeekdaySlot
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -59,12 +62,11 @@ class RestaurantViewModel(
     )
     val uiState: StateFlow<RestaurantUiState> = _uiState.asStateFlow()
 
-    private var nextOrderNumber = (_uiState.value.orders.maxOfOrNull { it.orderNumber } ?: 130) + 1
-    private var nextReviewId = 104
-    private var nextAlertId = 205
+    private var nextOrderNumber = (_uiState.value.orders.maxOfOrNull { it.orderNumber } ?: 100) + 1
+    private var nextReviewId = 101
+    private var nextAlertId = 201
     private var nextMenuId = 109
-    private var nextStaffId = 7
-    private val defaultKioskPassHashBytes: ByteArray by lazy { sha256Bytes("kiosk123") }
+    private var nextStaffId = 1
 
     init {
         startKitchenTimerLoop()
@@ -102,12 +104,12 @@ class RestaurantViewModel(
                 localSales = current.salesRecords
             )
             _uiState.update { state ->
-                val maxOrderNum = snapshot.orders.maxOfOrNull { it.orderNumber } ?: 130
+                val maxOrderNum = snapshot.orders.maxOfOrNull { it.orderNumber } ?: 100
                 if (maxOrderNum >= nextOrderNumber) {
                     nextOrderNumber = maxOrderNum + 1
                 }
                 val nextToken = maxOf(
-                    (snapshot.orders.mapNotNull { it.tokenNumber }.maxOrNull() ?: 15) + 1,
+                    (snapshot.orders.mapNotNull { it.tokenNumber }.maxOrNull() ?: 0) + 1,
                     state.nextKioskTokenNumber
                 )
                 state.copy(
@@ -319,27 +321,77 @@ class RestaurantViewModel(
         }
     }
 
-    // Admin Authentication (verifies against persisted SHA-256 hash, session kept in memory)
-    fun loginAdmin(username: String, password: String): Boolean {
-        val trimmedUser = username.trim()
-        if (trimmedUser.isNotEmpty() && !trimmedUser.equals("admin", ignoreCase = true) && !trimmedUser.equals("staff", ignoreCase = true)) {
-            return false
+    // Admin / Owner Authentication: strictly verified via Supabase Auth + profiles/staff_members role check
+    suspend fun loginAdmin(email: String, password: String): PasswordChangeResult {
+        val cleanEmail = email.trim()
+        val cleanPassword = password.trim()
+        if (cleanEmail.isEmpty() || !cleanEmail.contains("@")) {
+            return PasswordChangeResult.Error("Please enter a valid Admin email address.")
         }
-        val storedHash = credentialStorage.loadAdminPasswordHash() ?: DEFAULT_ADMIN_PASSCODE_SHA256
-        val inputDigest = sha256Bytes(password.trim())
-        val expectedDigest = hexToBytes(storedHash)
-        val valid = MessageDigest.isEqual(inputDigest, expectedDigest)
-        if (valid) {
-            _uiState.update {
-                it.copy(
-                    isAdminAuthenticated = true,
-                    authenticatedEmployeeId = null,
-                    adminTab = AdminTab.OWNER_DASHBOARD,
-                    toastMessage = "Admin Control Panel unlocked"
-                )
+        if (cleanPassword.isEmpty()) {
+            return PasswordChangeResult.Error("Please enter your password.")
+        }
+
+        return when (val result = repository.signInAdmin(cleanEmail, cleanPassword)) {
+            is SupabaseAuthResult.Error -> PasswordChangeResult.Error(result.message)
+            is SupabaseAuthResult.Success -> {
+                _uiState.update {
+                    it.copy(
+                        isAdminAuthenticated = true,
+                        authenticatedEmployeeId = null,
+                        adminTab = AdminTab.OWNER_DASHBOARD,
+                        toastMessage = "Admin Control Panel unlocked"
+                    )
+                }
+                refreshAuthenticatedWorkspace()
+                PasswordChangeResult.Success("Admin Control Panel unlocked")
             }
         }
-        return valid
+    }
+
+    private fun refreshAuthenticatedWorkspace() {
+        viewModelScope.launch {
+            coroutineScope {
+                val menuDef = async { repository.refreshMenu() }
+                val ordersDef = async { repository.refreshOrders() }
+                val staffDef = async { repository.refreshStaff() }
+                val attDef = async { repository.refreshAttendance() }
+                val revDef = async { repository.refreshReviews() }
+                val alertsDef = async { repository.refreshAlerts() }
+                val salesDef = async { repository.refreshSales() }
+
+                val menu = menuDef.await()
+                val orders = ordersDef.await()
+                val staff = staffDef.await()
+                val attendance = attDef.await()
+                val reviews = revDef.await()
+                val alerts = alertsDef.await()
+                val sales = salesDef.await()
+
+                _uiState.update { state ->
+                    val resolvedOrders = orders ?: state.orders
+                    val maxOrderNum = resolvedOrders.maxOfOrNull { it.orderNumber } ?: 100
+                    if (maxOrderNum >= nextOrderNumber) {
+                        nextOrderNumber = maxOrderNum + 1
+                    }
+                    val nextToken = maxOf(
+                        (resolvedOrders.mapNotNull { it.tokenNumber }.maxOrNull() ?: 0) + 1,
+                        state.nextKioskTokenNumber
+                    )
+                    state.copy(
+                        menuItems = menu ?: state.menuItems,
+                        orders = resolvedOrders,
+                        staff = staff ?: state.staff,
+                        attendanceRecords = attendance ?: state.attendanceRecords,
+                        reviews = reviews ?: state.reviews,
+                        alerts = alerts ?: state.alerts,
+                        salesRecords = sales ?: state.salesRecords,
+                        nextKioskTokenNumber = nextToken,
+                        supabaseSyncStatus = SupabaseSyncStatus.LIVE_SYNCED
+                    )
+                }
+            }
+        }
     }
 
     fun logoutAdmin() {
@@ -349,9 +401,12 @@ class RestaurantViewModel(
                 toastMessage = "Returned to Customer View"
             )
         }
+        viewModelScope.launch {
+            repository.signOutAuth()
+        }
     }
 
-    fun changeAdminPassword(
+    suspend fun changeAdminPassword(
         oldPassword: String,
         newPassword: String,
         confirmPassword: String
@@ -359,27 +414,31 @@ class RestaurantViewModel(
         if (!_uiState.value.isAdminAuthenticated) {
             return PasswordChangeResult.Error("Admin session required.")
         }
-        val storedHash = credentialStorage.loadAdminPasswordHash() ?: DEFAULT_ADMIN_PASSCODE_SHA256
-        val oldDigest = sha256Bytes(oldPassword.trim())
-        if (!MessageDigest.isEqual(oldDigest, hexToBytes(storedHash))) {
-            return PasswordChangeResult.Error("Old password is incorrect.")
+        if (oldPassword.trim().isEmpty()) {
+            return PasswordChangeResult.Error("Please enter your current password.")
         }
         val cleanNew = newPassword.trim()
-        if (cleanNew.length < 4) {
-            return PasswordChangeResult.Error("New password must be at least 4 characters.")
+        if (cleanNew.length < 8) {
+            return PasswordChangeResult.Error("New password must be at least 8 characters.")
         }
         if (cleanNew != confirmPassword.trim()) {
             return PasswordChangeResult.Error("New password and confirmation do not match.")
         }
-        val newHashHex = bytesToHex(sha256Bytes(cleanNew))
-        credentialStorage.saveAdminPasswordHash(newHashHex)
-        emitToast("Admin password updated successfully")
-        return PasswordChangeResult.Success("Admin password updated. Use your new password on future logins.")
+        val updateResult = repository.updateAdminPassword(cleanNew)
+        return if (updateResult.isSuccess) {
+            emitToast("Admin password updated in Supabase")
+            PasswordChangeResult.Success("Admin password updated. Use your new password on future logins.")
+        } else {
+            PasswordChangeResult.Error(
+                updateResult.exceptionOrNull()?.message ?: "Failed to update admin password."
+            )
+        }
     }
 
-    // Unified Employee Authentication (CNIC Login ID + Alphanumeric Password) -> Smart Portal Routing
-    fun loginEmployeeWithCnic(cnicInput: String, passwordInput: String): EmployeeLoginResult {
-        val cleanCnicKey = normalizeCnicKey(cnicInput)
+    // Unified Employee Authentication (CNIC Login ID + Password verified against live Supabase staff_members)
+    suspend fun loginEmployeeWithCnic(cnicInput: String, passwordInput: String): EmployeeLoginResult {
+        val cleanCnic = cnicInput.trim()
+        val cleanCnicKey = normalizeCnicKey(cleanCnic)
         val cleanPassword = passwordInput.trim()
         if (cleanCnicKey.isEmpty()) {
             return EmployeeLoginResult.Error("Please enter your CNIC Number (Login ID).")
@@ -388,11 +447,21 @@ class RestaurantViewModel(
             return EmployeeLoginResult.Error("Please enter your Password.")
         }
 
-        val state = _uiState.value
         val inputDigest = sha256Bytes(cleanPassword)
-        val matchedMember = state.staff.firstOrNull { member ->
-            normalizeCnicKey(member.cnic) == cleanCnicKey &&
-                MessageDigest.isEqual(inputDigest, hexToBytes(member.passwordHash))
+        val passHashHex = bytesToHex(inputDigest)
+
+        val matchedMember: StaffMember? = if (repository.isRemoteEnabled) {
+            val remoteMatch = repository.authenticateEmployee(cleanCnic, passHashHex).getOrNull()
+                ?: repository.authenticateEmployee(cleanCnicKey, passHashHex).getOrNull()
+            remoteMatch ?: _uiState.value.staff.firstOrNull { member ->
+                normalizeCnicKey(member.cnic) == cleanCnicKey &&
+                    MessageDigest.isEqual(inputDigest, hexToBytes(member.passwordHash))
+            }
+        } else {
+            _uiState.value.staff.firstOrNull { member ->
+                normalizeCnicKey(member.cnic) == cleanCnicKey &&
+                    MessageDigest.isEqual(inputDigest, hexToBytes(member.passwordHash))
+            }
         }
 
         if (matchedMember == null) {
@@ -403,13 +472,22 @@ class RestaurantViewModel(
         }
 
         _uiState.update { current ->
+            val mergedStaff = if (current.staff.any { it.id == matchedMember.id }) {
+                current.staff.map { if (it.id == matchedMember.id) matchedMember else it }
+            } else {
+                listOf(matchedMember) + current.staff
+            }
             current.copy(
                 isAdminAuthenticated = false,
                 authenticatedEmployeeId = matchedMember.id,
+                staff = mergedStaff,
                 chefTab = ChefTab.KITCHEN_KDS,
                 riderTab = RiderTab.READY_FOR_PICKUP,
                 toastMessage = "Welcome, ${matchedMember.name} (${matchedMember.portalRole.label})"
             )
+        }
+        if (repository.isRemoteEnabled) {
+            refreshAuthenticatedWorkspace()
         }
         return EmployeeLoginResult.Success(matchedMember)
     }
@@ -554,124 +632,121 @@ class RestaurantViewModel(
         }
     }
 
-    // "At Home" Customer Authentication (Daraz-style Google / Email / Phone OTP)
-    fun loginCustomerWithGoogle(
-        name: String = "Ayesha Khan",
-        email: String = "ayesha.khan@gmail.com"
-    ) {
-        val cleanEmail = email.trim().ifBlank { "ayesha.khan@gmail.com" }
-        val cleanName = name.trim().ifBlank { "Ayesha Khan" }
-        val profile = CustomerProfile(
-            id = "cust_google_${cleanEmail.lowercase()}",
-            name = cleanName,
-            email = cleanEmail,
-            provider = CustomerAuthProvider.GOOGLE
-        )
-        credentialStorage.saveLoggedInCustomer(profile)
-        _uiState.update { state ->
-            state.copy(
-                loggedInCustomer = profile,
-                customerMode = CustomerExperienceMode.HOME_DELIVERY,
-                customerTab = state.customerTab,
-                toastMessage = if (state.appLanguage == AppLanguage.UR) {
-                    "خوش آمدید، ${profile.name}"
-                } else {
-                    "Signed in with Google as ${profile.name}"
-                }
+    // "At Home" Customer Authentication: Real Supabase Google OAuth (PKCE) & Real Supabase Email OTP
+    fun startGoogleSignIn(): Result<String> {
+        return repository.beginGoogleOAuth { verifier ->
+            credentialStorage.savePendingOAuthVerifier(verifier)
+        }
+    }
+
+    suspend fun handleGoogleOAuthCallback(
+        code: String?,
+        accessTokenFromFragment: String?,
+        errorMessage: String?
+    ): PasswordChangeResult {
+        val persistedVerifier = credentialStorage.loadPendingOAuthVerifier()
+        credentialStorage.savePendingOAuthVerifier(null)
+        return when (
+            val res = repository.completeGoogleOAuth(
+                code = code,
+                accessTokenFromFragment = accessTokenFromFragment,
+                errorMessage = errorMessage,
+                persistedVerifier = persistedVerifier
+            )
+        ) {
+            is SupabaseAuthResult.Error -> {
+                emitToast(res.message)
+                PasswordChangeResult.Error(res.message)
+            }
+            is SupabaseAuthResult.Success -> finalizeCustomerAuthSession(
+                session = res.session,
+                fallbackName = "",
+                provider = CustomerAuthProvider.GOOGLE
             )
         }
     }
 
-    fun loginOrSignUpCustomerWithEmail(
+    suspend fun sendCustomerEmailOtp(
         name: String,
-        email: String,
-        password: String
+        email: String
     ): PasswordChangeResult {
         val cleanEmail = email.trim().lowercase()
-        val cleanPass = password.trim()
-        val cleanName = name.trim()
         if (!cleanEmail.contains("@") || !cleanEmail.contains(".")) {
             return PasswordChangeResult.Error("Please enter a valid email address.")
         }
-        if (cleanPass.length < 4) {
-            return PasswordChangeResult.Error("Password must be at least 4 characters.")
-        }
-
-        val accounts = credentialStorage.loadCustomerEmailAccounts()
-        val existing = accounts.firstOrNull { it.email.equals(cleanEmail, ignoreCase = true) }
-        val resolvedName: String
-        if (existing != null) {
-            val inputDigest = sha256Bytes(cleanPass)
-            if (!MessageDigest.isEqual(inputDigest, hexToBytes(existing.passwordHash))) {
-                return PasswordChangeResult.Error("Incorrect password for $cleanEmail.")
-            }
-            resolvedName = cleanName.ifBlank { existing.name }
+        val result = repository.sendEmailOtp(cleanEmail, name.trim())
+        return if (result.isSuccess) {
+            PasswordChangeResult.Success("Verification code sent to $cleanEmail.")
         } else {
-            resolvedName = cleanName.ifBlank { cleanEmail.substringBefore("@").replaceFirstChar { it.uppercase() } }
-            val newAccount = RegisteredCustomerAccount(
-                email = cleanEmail,
-                name = resolvedName,
-                passwordHash = bytesToHex(sha256Bytes(cleanPass))
+            PasswordChangeResult.Error(
+                result.exceptionOrNull()?.message ?: "Failed to send verification code."
             )
-            credentialStorage.saveCustomerEmailAccounts(accounts + newAccount)
         }
+    }
 
+    suspend fun verifyCustomerEmailOtp(
+        name: String,
+        email: String,
+        otpCode: String
+    ): PasswordChangeResult {
+        val cleanEmail = email.trim().lowercase()
+        val cleanOtp = otpCode.trim()
+        if (!cleanEmail.contains("@") || !cleanEmail.contains(".")) {
+            return PasswordChangeResult.Error("Please enter a valid email address.")
+        }
+        if (cleanOtp.length < 4) {
+            return PasswordChangeResult.Error("Please enter the verification code from your email.")
+        }
+        return when (val res = repository.verifyEmailOtp(cleanEmail, cleanOtp)) {
+            is SupabaseAuthResult.Error -> PasswordChangeResult.Error(res.message)
+            is SupabaseAuthResult.Success -> finalizeCustomerAuthSession(
+                session = res.session,
+                fallbackName = name.trim(),
+                provider = CustomerAuthProvider.EMAIL
+            )
+        }
+    }
+
+    private suspend fun finalizeCustomerAuthSession(
+        session: SupabaseAuthSession,
+        fallbackName: String,
+        provider: CustomerAuthProvider
+    ): PasswordChangeResult {
+        val resolvedName = session.fullName.ifBlank {
+            fallbackName.ifBlank {
+                session.email.substringBefore("@").ifBlank { "Smart Dine Guest" }
+                    .replaceFirstChar { it.uppercase() }
+            }
+        }
         val profile = CustomerProfile(
-            id = "cust_email_$cleanEmail",
+            id = session.userId,
             name = resolvedName,
-            email = cleanEmail,
-            provider = CustomerAuthProvider.EMAIL
+            email = session.email,
+            avatarUrl = session.avatarUrl,
+            provider = provider
         )
         credentialStorage.saveLoggedInCustomer(profile)
         _uiState.update { state ->
             state.copy(
                 loggedInCustomer = profile,
                 customerMode = CustomerExperienceMode.HOME_DELIVERY,
-                customerTab = state.customerTab,
                 toastMessage = if (state.appLanguage == AppLanguage.UR) {
                     "خوش آمدید، $resolvedName"
                 } else {
-                    "Welcome back, $resolvedName!"
+                    "Welcome, $resolvedName!"
                 }
             )
+        }
+        if (repository.isRemoteEnabled) {
+            repository.refreshOrders()?.let { freshOrders ->
+                _uiState.update { state ->
+                    val maxOrderNum = freshOrders.maxOfOrNull { it.orderNumber } ?: 100
+                    if (maxOrderNum >= nextOrderNumber) nextOrderNumber = maxOrderNum + 1
+                    state.copy(orders = freshOrders)
+                }
+            }
         }
         return PasswordChangeResult.Success("Signed in as $resolvedName")
-    }
-
-    fun loginCustomerWithPhoneOtp(
-        name: String,
-        phone: String,
-        otp: String
-    ): PasswordChangeResult {
-        val cleanPhone = phone.trim()
-        val digits = cleanPhone.filter { it.isDigit() }
-        if (digits.length < 7) {
-            return PasswordChangeResult.Error("Please enter a valid phone number.")
-        }
-        if (otp.trim() != "1234") {
-            return PasswordChangeResult.Error("Invalid OTP. Use demo OTP 1234.")
-        }
-        val cleanName = name.trim().ifBlank { "Smart Dine Guest" }
-        val profile = CustomerProfile(
-            id = "cust_phone_$digits",
-            name = cleanName,
-            phone = cleanPhone,
-            provider = CustomerAuthProvider.PHONE
-        )
-        credentialStorage.saveLoggedInCustomer(profile)
-        _uiState.update { state ->
-            state.copy(
-                loggedInCustomer = profile,
-                customerMode = CustomerExperienceMode.HOME_DELIVERY,
-                customerTab = state.customerTab,
-                toastMessage = if (state.appLanguage == AppLanguage.UR) {
-                    "فون نمبر کی تصدیق ہو گئی، $cleanName"
-                } else {
-                    "Phone verified • Welcome $cleanName!"
-                }
-            )
-        }
-        return PasswordChangeResult.Success("Signed in with phone")
     }
 
     fun logoutCustomer() {
@@ -684,20 +759,13 @@ class RestaurantViewModel(
                 toastMessage = if (state.appLanguage == AppLanguage.UR) "کسٹمر اکاؤنٹ لاگ آؤٹ ہو گیا" else "Signed out of Customer account"
             )
         }
+        viewModelScope.launch {
+            repository.signOutAuth()
+        }
     }
 
-    // Password-Protected At Restaurant (Kiosk Mode) Activation & Lock Exit
-    fun activateKioskMode(kioskId: String, password: String): PasswordChangeResult {
-        val cleanId = kioskId.trim()
-        val cleanPass = password.trim()
-        if (cleanId.isEmpty() || cleanPass.isEmpty()) {
-            return PasswordChangeResult.Error("Please enter both Kiosk ID and Password.")
-        }
-        val idValid = cleanId.equals(DEFAULT_KIOSK_ID, ignoreCase = true)
-        val passValid = MessageDigest.isEqual(sha256Bytes(cleanPass), defaultKioskPassHashBytes)
-        if (!idValid || !passValid) {
-            return PasswordChangeResult.Error("Invalid Kiosk ID or Password.")
-        }
+    // At Restaurant (Kiosk Mode) — directly accessible for customer ordering without an admin password
+    fun activateKioskMode() {
         _uiState.update { state ->
             state.copy(
                 isAdminAuthenticated = false,
@@ -714,21 +782,9 @@ class RestaurantViewModel(
                 }
             )
         }
-        return PasswordChangeResult.Success("Kiosk Mode activated")
     }
 
-    fun exitKioskMode(password: String): PasswordChangeResult {
-        val cleanPass = password.trim()
-        if (cleanPass.isEmpty()) {
-            return PasswordChangeResult.Error("Please enter Kiosk or Admin password.")
-        }
-        val inputDigest = sha256Bytes(cleanPass)
-        val storedAdminHash = credentialStorage.loadAdminPasswordHash() ?: DEFAULT_ADMIN_PASSCODE_SHA256
-        val matchesKiosk = MessageDigest.isEqual(inputDigest, defaultKioskPassHashBytes)
-        val matchesAdmin = MessageDigest.isEqual(inputDigest, hexToBytes(storedAdminHash))
-        if (!matchesKiosk && !matchesAdmin) {
-            return PasswordChangeResult.Error("Incorrect password. Enter Kiosk or Admin password to exit.")
-        }
+    fun exitKioskMode() {
         _uiState.update { state ->
             state.copy(
                 customerMode = CustomerExperienceMode.HOME_DELIVERY,
@@ -739,11 +795,10 @@ class RestaurantViewModel(
                 toastMessage = if (state.appLanguage == AppLanguage.UR) {
                     "ہوم ڈیلیوری موڈ پر واپس آ گئے"
                 } else {
-                    "Exited Kiosk Mode • Returned to Home Delivery"
+                    "Returned to Home Delivery"
                 }
             )
         }
-        return PasswordChangeResult.Success("Exited Kiosk Mode")
     }
 
     fun selectCustomerTab(tab: CustomerTab) {
@@ -864,24 +919,38 @@ class RestaurantViewModel(
                 timeLabel = "Just now",
                 type = AlertType.KIOSK_ORDER
             ).also { createdAlert = it }
-            val updatedSales = state.salesRecords.map { rec ->
-                if (rec.dateIso == today) {
-                    val updatedBars = rec.hourlyBars.mapIndexed { idx, pt ->
-                        if (idx == rec.hourlyBars.lastIndex) pt.copy(amountRs = pt.amountRs + newOrder.grandTotalRs) else pt
-                    }
-                    rec.copy(
-                        grossRevenueRs = rec.grossRevenueRs + newOrder.grandTotalRs,
-                        onlineRevenueRs = rec.onlineRevenueRs + if (isOnline) newOrder.grandTotalRs else 0,
-                        cashRevenueRs = rec.cashRevenueRs + if (!isOnline) newOrder.grandTotalRs else 0,
-                        deliveryRevenueRs = rec.deliveryRevenueRs,
-                        kioskRevenueRs = rec.kioskRevenueRs + newOrder.grandTotalRs,
-                        orderCount = rec.orderCount + 1,
-                        deliveryOrderCount = rec.deliveryOrderCount,
-                        kioskOrderCount = rec.kioskOrderCount + 1,
-                        hourlyBars = updatedBars
-                    ).also { updatedTodaySales = it }
-                } else rec
-            }
+            val existingToday = state.salesRecords.firstOrNull { it.dateIso == today } ?: DailySalesRecord(
+                dateIso = today,
+                grossRevenueRs = 0,
+                onlineRevenueRs = 0,
+                cashRevenueRs = 0,
+                deliveryRevenueRs = 0,
+                kioskRevenueRs = 0,
+                deliveryOrderCount = 0,
+                kioskOrderCount = 0,
+                topSellerLabel = lineItems.firstOrNull()?.title ?: "Kitchen Order",
+                orderCount = 0,
+                hourlyBars = listOf(
+                    SalesBarPoint("10a", 0),
+                    SalesBarPoint("12p", 0),
+                    SalesBarPoint("2p", 0),
+                    SalesBarPoint("4p", 0),
+                    SalesBarPoint("6p", 0),
+                    SalesBarPoint("8p", 0)
+                )
+            )
+            val updatedToday = existingToday.copy(
+                grossRevenueRs = existingToday.grossRevenueRs + newOrder.grandTotalRs,
+                onlineRevenueRs = existingToday.onlineRevenueRs + if (isOnline) newOrder.grandTotalRs else 0,
+                cashRevenueRs = existingToday.cashRevenueRs + if (!isOnline) newOrder.grandTotalRs else 0,
+                kioskRevenueRs = existingToday.kioskRevenueRs + newOrder.grandTotalRs,
+                orderCount = existingToday.orderCount + 1,
+                kioskOrderCount = existingToday.kioskOrderCount + 1,
+                hourlyBars = existingToday.hourlyBars.mapIndexed { idx, pt ->
+                    if (idx == existingToday.hourlyBars.lastIndex) pt.copy(amountRs = pt.amountRs + newOrder.grandTotalRs) else pt
+                }
+            ).also { updatedTodaySales = it }
+            val updatedSales = listOf(updatedToday) + state.salesRecords.filterNot { it.dateIso == today }
             val updatedOrders = listOf(newOrder) + state.orders
             credentialStorage.saveDeliveryOrders(updatedOrders)
             created = newOrder
@@ -969,24 +1038,38 @@ class RestaurantViewModel(
                 type = AlertType.DELIVERY_ORDER
             ).also { createdAlert = it }
             val today = DateUtils.todayIso()
-            val updatedSales = state.salesRecords.map { rec ->
-                if (rec.dateIso == today) {
-                    val updatedBars = rec.hourlyBars.mapIndexed { idx, pt ->
-                        if (idx == rec.hourlyBars.lastIndex) pt.copy(amountRs = pt.amountRs + newOrder.grandTotalRs) else pt
-                    }
-                    rec.copy(
-                        grossRevenueRs = rec.grossRevenueRs + newOrder.grandTotalRs,
-                        onlineRevenueRs = rec.onlineRevenueRs + if (isOnline) newOrder.grandTotalRs else 0,
-                        cashRevenueRs = rec.cashRevenueRs + if (!isOnline) newOrder.grandTotalRs else 0,
-                        deliveryRevenueRs = rec.deliveryRevenueRs + newOrder.grandTotalRs,
-                        kioskRevenueRs = rec.kioskRevenueRs,
-                        orderCount = rec.orderCount + 1,
-                        deliveryOrderCount = rec.deliveryOrderCount + 1,
-                        kioskOrderCount = rec.kioskOrderCount,
-                        hourlyBars = updatedBars
-                    ).also { updatedTodaySales = it }
-                } else rec
-            }
+            val existingToday = state.salesRecords.firstOrNull { it.dateIso == today } ?: DailySalesRecord(
+                dateIso = today,
+                grossRevenueRs = 0,
+                onlineRevenueRs = 0,
+                cashRevenueRs = 0,
+                deliveryRevenueRs = 0,
+                kioskRevenueRs = 0,
+                deliveryOrderCount = 0,
+                kioskOrderCount = 0,
+                topSellerLabel = lineItems.firstOrNull()?.title ?: "Delivery Order",
+                orderCount = 0,
+                hourlyBars = listOf(
+                    SalesBarPoint("10a", 0),
+                    SalesBarPoint("12p", 0),
+                    SalesBarPoint("2p", 0),
+                    SalesBarPoint("4p", 0),
+                    SalesBarPoint("6p", 0),
+                    SalesBarPoint("8p", 0)
+                )
+            )
+            val updatedToday = existingToday.copy(
+                grossRevenueRs = existingToday.grossRevenueRs + newOrder.grandTotalRs,
+                onlineRevenueRs = existingToday.onlineRevenueRs + if (isOnline) newOrder.grandTotalRs else 0,
+                cashRevenueRs = existingToday.cashRevenueRs + if (!isOnline) newOrder.grandTotalRs else 0,
+                deliveryRevenueRs = existingToday.deliveryRevenueRs + newOrder.grandTotalRs,
+                orderCount = existingToday.orderCount + 1,
+                deliveryOrderCount = existingToday.deliveryOrderCount + 1,
+                hourlyBars = existingToday.hourlyBars.mapIndexed { idx, pt ->
+                    if (idx == existingToday.hourlyBars.lastIndex) pt.copy(amountRs = pt.amountRs + newOrder.grandTotalRs) else pt
+                }
+            ).also { updatedTodaySales = it }
+            val updatedSales = listOf(updatedToday) + state.salesRecords.filterNot { it.dateIso == today }
             val updatedOrders = listOf(newOrder) + state.orders
             credentialStorage.saveDeliveryOrders(updatedOrders)
             placed = true
@@ -1764,12 +1847,6 @@ class RestaurantViewModel(
         }
     }
 
-    companion object {
-        private const val DEFAULT_ADMIN_PASSCODE_SHA256 =
-            "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9"
-        const val DEFAULT_KIOSK_ID = "kiosk01"
-    }
-
     private fun createInitialState(
         persistedMenu: List<MenuItem>?,
         persistedStaff: List<StaffMember>?,
@@ -1777,11 +1854,7 @@ class RestaurantViewModel(
         persistedDeliveryOrders: List<KitchenOrder>?,
         persistedLanguage: AppLanguage?
     ): RestaurantUiState {
-        val today = DateUtils.todayIso()
-        val yesterday = DateUtils.daysAgoIso(1)
-        val todayWeekday = DateUtils.weekdayForIso(today)
-
-        val sampleMenu = persistedMenu ?: listOf(
+        val defaultCatalogMenu = persistedMenu ?: listOf(
             MenuItem(
                 id = "item_1",
                 title = "Smash Burger",
@@ -1830,8 +1903,7 @@ class RestaurantViewModel(
                 priceRs = 390,
                 prepTimeRange = "5-8 min",
                 spiceLevel = SpiceLevel.REFRESHING,
-                artwork = MenuArtwork.MINT_COOLER_ART,
-                isLowStock = true
+                artwork = MenuArtwork.MINT_COOLER_ART
             ),
             MenuItem(
                 id = "item_6",
@@ -1865,417 +1937,29 @@ class RestaurantViewModel(
             )
         )
 
-        val initialOrders = listOf(
-            KitchenOrder(
-                orderNumber = 130,
-                tableCode = "Token #15",
-                items = listOf(
-                    OrderLineItem("item_3", "Chicken Biryani", 790, 2),
-                    OrderLineItem("item_7", "Choco Cake", 550, 1)
-                ),
-                status = OrderStatus.NEW,
-                elapsedSeconds = 38,
-                orderType = OrderType.KIOSK,
-                tokenNumber = 15,
-                isPaid = true,
-                paymentMethod = PaymentMethod.ONLINE,
-                placedAtLabel = "1m ago",
-                orderDateIso = today
-            ),
-            KitchenOrder(
-                orderNumber = 129,
-                tableCode = "DELIVERY",
-                items = listOf(
-                    OrderLineItem("item_2", "Margherita Pizza", 1290, 1, "Extra basil"),
-                    OrderLineItem("item_5", "Mint Cooler", 390, 2)
-                ),
-                status = OrderStatus.NEW,
-                elapsedSeconds = 85,
-                orderType = OrderType.DELIVERY,
-                customerName = "Zain Tariq",
-                customerPhone = "+92 300 5541122",
-                deliveryAddress = "House 42, Street 7, Gulberg III, Lahore",
-                gpsCoordinatesLabel = "31.5122, 74.3487",
-                cancelWindowRemainingSeconds = 110,
-                isPaid = false,
-                paymentMethod = PaymentMethod.CASH_ON_DELIVERY,
-                placedAtLabel = "2m ago",
-                orderDateIso = today
-            ),
-            KitchenOrder(
-                orderNumber = 128,
-                tableCode = "Token #14",
-                items = listOf(
-                    OrderLineItem("item_1", "Smash Burger", 890, 1, "No raw onion"),
-                    OrderLineItem("item_5", "Mint Cooler", 390, 1)
-                ),
-                status = OrderStatus.PREPARING,
-                elapsedSeconds = 255,
-                orderType = OrderType.KIOSK,
-                tokenNumber = 14,
-                isPaid = false,
-                paymentMethod = PaymentMethod.PAY_AT_COUNTER,
-                placedAtLabel = "4m ago",
-                orderDateIso = today
-            ),
-            KitchenOrder(
-                orderNumber = 127,
-                tableCode = "DELIVERY",
-                items = listOf(
-                    OrderLineItem("item_1", "Smash Burger", 890, 2),
-                    OrderLineItem("item_7", "Choco Cake", 550, 1)
-                ),
-                status = OrderStatus.READY,
-                elapsedSeconds = 642,
-                orderType = OrderType.DELIVERY,
-                customerName = "Sana Malik",
-                customerPhone = "+92 321 9981234",
-                deliveryAddress = "Apt 12B, Askari XI, Lahore",
-                gpsCoordinatesLabel = "31.4910, 74.3912",
-                isPaid = true,
-                paymentMethod = PaymentMethod.ONLINE_DELIVERY,
-                placedAtLabel = "11m ago",
-                orderDateIso = today
-            ),
-            KitchenOrder(
-                orderNumber = 126,
-                tableCode = "Token #12",
-                items = listOf(
-                    OrderLineItem("item_2", "Margherita Pizza", 1290, 2),
-                    OrderLineItem("item_6", "Iced Caramel Latte", 460, 2)
-                ),
-                status = OrderStatus.SERVED,
-                elapsedSeconds = 820,
-                orderType = OrderType.KIOSK,
-                tokenNumber = 12,
-                isPaid = true,
-                paymentMethod = PaymentMethod.ONLINE,
-                placedAtLabel = "35m ago",
-                orderDateIso = today,
-                completedDateIso = today,
-                completedTimeLabel = "08:32 AM"
-            ),
-            KitchenOrder(
-                orderNumber = 125,
-                tableCode = "Token #11",
-                items = listOf(
-                    OrderLineItem("item_3", "Chicken Biryani", 790, 2),
-                    OrderLineItem("item_5", "Mint Cooler", 390, 2)
-                ),
-                status = OrderStatus.SERVED,
-                elapsedSeconds = 940,
-                orderType = OrderType.KIOSK,
-                tokenNumber = 11,
-                isPaid = true,
-                paymentMethod = PaymentMethod.PAY_AT_COUNTER,
-                placedAtLabel = "52m ago",
-                orderDateIso = today,
-                completedDateIso = today,
-                completedTimeLabel = "08:14 AM"
-            ),
-            KitchenOrder(
-                orderNumber = 121,
-                tableCode = "DELIVERY",
-                items = listOf(
-                    OrderLineItem("item_1", "Smash Burger", 890, 3),
-                    OrderLineItem("item_4", "Truffle Parm Fries", 490, 2)
-                ),
-                status = OrderStatus.SERVED,
-                elapsedSeconds = 760,
-                orderType = OrderType.DELIVERY,
-                customerName = "Faisal Mehmood",
-                customerPhone = "+92 333 7711990",
-                deliveryAddress = "Block H, Model Town, Lahore",
-                isPaid = true,
-                paymentMethod = PaymentMethod.ONLINE_DELIVERY,
-                placedAtLabel = "Yesterday",
-                orderDateIso = yesterday,
-                completedDateIso = yesterday,
-                completedTimeLabel = "08:45 PM",
-                assignedRiderId = "st_3",
-                assignedRiderName = "Rider Bilal"
-            ),
-            KitchenOrder(
-                orderNumber = 120,
-                tableCode = "Token #10",
-                items = listOf(
-                    OrderLineItem("item_8", "Basque Cheesecake", 680, 2),
-                    OrderLineItem("item_6", "Iced Caramel Latte", 460, 2)
-                ),
-                status = OrderStatus.SERVED,
-                elapsedSeconds = 610,
-                orderType = OrderType.KIOSK,
-                tokenNumber = 10,
-                isPaid = true,
-                paymentMethod = PaymentMethod.PAY_AT_COUNTER,
-                placedAtLabel = "Yesterday",
-                orderDateIso = yesterday,
-                completedDateIso = yesterday,
-                completedTimeLabel = "07:20 PM"
-            )
-        )
-
-        val staff = persistedStaff ?: listOf(
-            StaffMember(
-                id = "st_1",
-                name = "Chef Tariq",
-                cnic = "34601-1111111-1",
-                passwordHash = bytesToHex(sha256Bytes("chef123")),
-                designation = "Head Chef",
-                portalRole = StaffPortalRole.KITCHEN_CHEF,
-                phone = "+92 300 4112201",
-                address = "House 14, Block C, Gulberg III",
-                email = "tariq@smartdine.app",
-                shiftLabel = "09:00 - 18:00",
-                isOnDuty = true,
-                isRelieved = false,
-                scheduledDayOff = WeekdaySlot.MONDAY
-            ),
-            StaffMember(
-                id = "st_2",
-                name = "Chef Sara",
-                cnic = "34601-3333333-3",
-                passwordHash = bytesToHex(sha256Bytes("sara123")),
-                designation = "Grill & Pizza Chef",
-                portalRole = StaffPortalRole.KITCHEN_CHEF,
-                phone = "+92 321 5223302",
-                address = "Apt 7B, Model Town Link Rd",
-                email = "sara@smartdine.app",
-                shiftLabel = "11:00 - 20:00",
-                isOnDuty = true,
-                isRelieved = false,
-                scheduledDayOff = WeekdaySlot.TUESDAY
-            ),
-            StaffMember(
-                id = "st_3",
-                name = "Rider Bilal",
-                cnic = "34601-2222222-2",
-                passwordHash = bytesToHex(sha256Bytes("rider123")),
-                designation = "Delivery Rider",
-                portalRole = StaffPortalRole.DELIVERY_RIDER,
-                phone = "+92 333 6334403",
-                address = "Street 9, Johar Town Phase 2",
-                email = "bilal@smartdine.app",
-                shiftLabel = "10:00 - 19:00",
-                isOnDuty = true,
-                isRelieved = false,
-                scheduledDayOff = WeekdaySlot.WEDNESDAY
-            ),
-            StaffMember(
-                id = "st_4",
-                name = "Ayesha Noor",
-                cnic = "34601-4444444-4",
-                passwordHash = bytesToHex(sha256Bytes("staff123")),
-                designation = "Floor Host",
-                portalRole = StaffPortalRole.GENERAL_STAFF,
-                phone = "+92 345 7445504",
-                address = "Flat 3, DHA Phase 5",
-                email = "ayesha@smartdine.app",
-                shiftLabel = "12:00 - 21:00",
-                isOnDuty = true,
-                isRelieved = false,
-                scheduledDayOff = WeekdaySlot.FRIDAY
-            ),
-            StaffMember(
-                id = "st_5",
-                name = "Hamza Ali",
-                cnic = "34601-5555555-5",
-                passwordHash = bytesToHex(sha256Bytes("hamza123")),
-                designation = "Barista & Drinks",
-                portalRole = StaffPortalRole.GENERAL_STAFF,
-                phone = "+92 301 8556605",
-                address = "Plot 22, Garden Town",
-                email = "",
-                shiftLabel = "10:00 - 19:00",
-                isOnDuty = true,
-                isRelieved = false,
-                scheduledDayOff = WeekdaySlot.SUNDAY
-            ),
-            StaffMember(
-                id = "st_6",
-                name = "Zainab Raza",
-                cnic = "34601-6666666-6",
-                passwordHash = bytesToHex(sha256Bytes("zainab123")),
-                designation = "Evening Cashier",
-                portalRole = StaffPortalRole.GENERAL_STAFF,
-                phone = "+92 312 9667706",
-                address = "House 88, Cavalry Ground",
-                email = "zainab@smartdine.app",
-                shiftLabel = "16:00 - 00:00",
-                isOnDuty = false,
-                isRelieved = false,
-                scheduledDayOff = todayWeekday
-            )
-        )
-
-        val initialAttendance = listOf(
-            AttendanceRecord("st_1", today, AttendanceStatus.PRESENT, "08:55 AM"),
-            AttendanceRecord("st_2", today, AttendanceStatus.PRESENT, "10:52 AM"),
-            AttendanceRecord("st_3", today, AttendanceStatus.PRESENT, "09:58 AM"),
-            AttendanceRecord("st_4", today, AttendanceStatus.LEAVE, null),
-            AttendanceRecord("st_5", today, AttendanceStatus.ABSENT, null),
-            AttendanceRecord("st_1", yesterday, AttendanceStatus.PRESENT, "09:00 AM"),
-            AttendanceRecord("st_2", yesterday, AttendanceStatus.PRESENT, "11:02 AM"),
-            AttendanceRecord("st_3", yesterday, AttendanceStatus.PRESENT, "10:01 AM"),
-            AttendanceRecord("st_4", yesterday, AttendanceStatus.PRESENT, "11:55 AM"),
-            AttendanceRecord("st_5", yesterday, AttendanceStatus.PRESENT, "10:05 AM"),
-            AttendanceRecord("st_6", yesterday, AttendanceStatus.PRESENT, "04:00 PM")
-        )
-
-        val alerts = listOf(
-            WhatsAppAlert(
-                id = "alert_1",
-                title = "Kiosk Order • Token #15",
-                message = "Order #130 (Dine-In / Kiosk) ordered 2x Chicken Biryani, 1x Choco Cake (Rs 2,237).",
-                timeLabel = "1m ago",
-                type = AlertType.KIOSK_ORDER
-            ),
-            WhatsAppAlert(
-                id = "alert_2",
-                title = "Low Stock Alert: Mint Cooler",
-                message = "Mint leaves & lime prep below 15% threshold. Restock bar station.",
-                timeLabel = "9m ago",
-                type = AlertType.LOW_STOCK
-            ),
-            WhatsAppAlert(
-                id = "alert_3",
-                title = "Home Delivery • #129",
-                message = "Zain Tariq (Gulberg III) ordered 1x Margherita Pizza, 2x Mint Cooler.",
-                timeLabel = "2m ago",
-                type = AlertType.DELIVERY_ORDER
-            )
-        )
-
-        val reviews = listOf(
-            ReviewEntry(
-                id = "rev_101",
-                authorName = "Omar S.",
-                tableCode = "DELIVERY",
-                rating = 5,
-                tags = listOf("Tasty food", "Fast service"),
-                comment = "Home delivery was super quick and the Smash Burger arrived piping hot in under 25 minutes.",
-                timestampLabel = "25m ago",
-                isPublishedToSite = true
-            ),
-            ReviewEntry(
-                id = "rev_102",
-                authorName = "Hira M.",
-                tableCode = "KIOSK",
-                rating = 5,
-                tags = listOf("Easy self-order", "Fresh drinks"),
-                comment = "Ordered on the counter touch kiosk and got Token #12 in seconds. Zero queue wait!",
-                timestampLabel = "1h ago",
-                isPublishedToSite = true
-            )
-        )
-
-        val monthDays = DateUtils.monthDaysInCurrentMonth()
-        val topSellers = listOf(
-            "Smash Burger (48 sold)",
-            "Margherita Pizza (41 sold)",
-            "Chicken Biryani (52 sold)",
-            "Mint Cooler (64 sold)"
-        )
-        val salesRecords = monthDays.mapIndexed { idx, iso ->
-            when (iso) {
-                today -> DailySalesRecord(
-                    dateIso = iso,
-                    grossRevenueRs = 184500,
-                    onlineRevenueRs = 118080,
-                    cashRevenueRs = 66420,
-                    deliveryRevenueRs = 106800,
-                    kioskRevenueRs = 77700,
-                    topSellerLabel = "Smash Burger (48 sold)",
-                    orderCount = 146,
-                    deliveryOrderCount = 78,
-                    kioskOrderCount = 68,
-                    hourlyBars = listOf(
-                        SalesBarPoint("12p", 18400),
-                        SalesBarPoint("1p", 27600),
-                        SalesBarPoint("2p", 24200),
-                        SalesBarPoint("4p", 15900),
-                        SalesBarPoint("6p", 29800),
-                        SalesBarPoint("7p", 36400),
-                        SalesBarPoint("8p", 32200)
-                    )
-                )
-                yesterday -> DailySalesRecord(
-                    dateIso = iso,
-                    grossRevenueRs = 162800,
-                    onlineRevenueRs = 99300,
-                    cashRevenueRs = 63500,
-                    deliveryRevenueRs = 94200,
-                    kioskRevenueRs = 68600,
-                    topSellerLabel = "Margherita Pizza (41 sold)",
-                    orderCount = 129,
-                    deliveryOrderCount = 69,
-                    kioskOrderCount = 60,
-                    hourlyBars = listOf(
-                        SalesBarPoint("12p", 14800),
-                        SalesBarPoint("1p", 23500),
-                        SalesBarPoint("2p", 21900),
-                        SalesBarPoint("4p", 13200),
-                        SalesBarPoint("6p", 27400),
-                        SalesBarPoint("7p", 33100),
-                        SalesBarPoint("8p", 28900)
-                    )
-                )
-                else -> {
-                    val base = 118000 + ((idx * 17300) % 68000)
-                    val online = (base * 0.61).toInt()
-                    val cash = base - online
-                    val delRev = (base * 0.56).toInt()
-                    val kioskRev = base - delRev
-                    val totalOrders = 92 + (idx * 7) % 45
-                    val delOrders = (totalOrders * 0.54).toInt()
-                    val kioskOrders = totalOrders - delOrders
-                    DailySalesRecord(
-                        dateIso = iso,
-                        grossRevenueRs = base,
-                        onlineRevenueRs = online,
-                        cashRevenueRs = cash,
-                        deliveryRevenueRs = delRev,
-                        kioskRevenueRs = kioskRev,
-                        topSellerLabel = topSellers[idx % topSellers.size],
-                        orderCount = totalOrders,
-                        deliveryOrderCount = delOrders,
-                        kioskOrderCount = kioskOrders,
-                        hourlyBars = listOf(
-                            SalesBarPoint("12p", (base * 0.10).toInt()),
-                            SalesBarPoint("1p", (base * 0.15).toInt()),
-                            SalesBarPoint("2p", (base * 0.13).toInt()),
-                            SalesBarPoint("4p", (base * 0.09).toInt()),
-                            SalesBarPoint("6p", (base * 0.17).toInt()),
-                            SalesBarPoint("7p", (base * 0.20).toInt()),
-                            SalesBarPoint("8p", (base * 0.16).toInt())
-                        )
-                    )
-                }
-            }
-        }.reversed()
-
         val persistedOrders = persistedDeliveryOrders.orEmpty()
-        val mergedOrders = (persistedOrders + initialOrders)
             .distinctBy { it.orderNumber }
             .sortedByDescending { it.orderNumber }
         val nextToken = maxOf(
-            (mergedOrders.mapNotNull { it.tokenNumber }.maxOrNull() ?: 15) + 1,
-            16
+            (persistedOrders.mapNotNull { it.tokenNumber }.maxOrNull() ?: 0) + 1,
+            1
         )
 
         return RestaurantUiState(
             appLanguage = persistedLanguage ?: AppLanguage.EN,
+            isAdminAuthenticated = false,
+            authenticatedEmployeeId = null,
             loggedInCustomer = persistedCustomer,
             customerMode = CustomerExperienceMode.HOME_DELIVERY,
             customerTab = CustomerTab.MENU,
             nextKioskTokenNumber = nextToken,
-            menuItems = sampleMenu,
-            orders = mergedOrders,
-            staff = staff,
-            attendanceRecords = initialAttendance,
-            salesRecords = salesRecords,
-            alerts = alerts,
-            reviews = reviews
+            menuItems = defaultCatalogMenu,
+            orders = persistedOrders,
+            staff = persistedStaff.orEmpty(),
+            attendanceRecords = emptyList(),
+            salesRecords = emptyList(),
+            alerts = emptyList(),
+            reviews = emptyList()
         )
     }
 }

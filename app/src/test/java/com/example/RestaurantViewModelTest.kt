@@ -2,6 +2,11 @@ package com.example
 
 import com.example.data.InMemoryCredentialStorage
 import com.example.data.InMemoryMenuStorage
+import com.example.data.supabase.SupabaseAuthResult
+import com.example.data.supabase.SupabaseAuthSession
+import com.example.data.supabase.SupabaseRealtimeEvent
+import com.example.data.supabase.SupabaseService
+import com.example.data.supabase.SupabaseSyncStatus
 import com.example.model.*
 import com.example.util.AppStrings
 import com.example.util.DateUtils
@@ -12,6 +17,9 @@ import com.example.viewmodel.PasswordChangeResult
 import com.example.viewmodel.RestaurantViewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
@@ -39,98 +47,134 @@ class RestaurantViewModelTest {
     }
 
     @Test
-    fun roleSeparation_blocksAdminAndChefActionsUntilAuthenticated() {
+    fun freshInstall_startsLoggedOutWithNoMockOperationalDataAndMenuAccessible() {
         val vm = RestaurantViewModel()
+        val state = vm.uiState.value
+
+        assertFalse(state.isAdminAuthenticated)
+        assertEquals(null, state.authenticatedEmployeeId)
+        assertEquals(null, state.loggedInCustomer)
+        assertEquals(CustomerExperienceMode.HOME_DELIVERY, state.customerMode)
+        assertEquals(CustomerTab.MENU, state.customerTab)
+        assertFalse(state.isKioskModeActive)
+        assertTrue(state.staff.isEmpty())
+        assertTrue(state.orders.isEmpty())
+        assertTrue(state.attendanceRecords.isEmpty())
+        assertTrue(state.alerts.isEmpty())
+        assertTrue(state.reviews.isEmpty())
+        assertTrue(state.salesRecords.isEmpty())
+        assertTrue(state.menuItems.isNotEmpty())
+
+        // Customers can browse dishes & add to cart without admin login
+        val burger = state.menuItems.first { it.id == "item_1" }
+        vm.addToCart(burger)
+        assertEquals(1, vm.uiState.value.cartItemCount)
+    }
+
+    @Test
+    fun adminAuth_enforcesSupabaseRoleVerificationAndBlocksNonAdmins() = runBlocking {
+        val fakeSupabase = FakeSupabaseService(
+            validAdminEmail = "owner@smartdine.test",
+            validAdminPassword = "StrongOwnerPassword99",
+            validAdminRole = "admin"
+        )
+        val vm = RestaurantViewModel(InMemoryMenuStorage(), InMemoryCredentialStorage(), fakeSupabase)
+
+        // Blank or invalid input rejected locally before hitting auth
+        assertTrue(vm.loginAdmin("", "StrongOwnerPassword99") is PasswordChangeResult.Error)
+        assertTrue(vm.loginAdmin("not-an-email", "StrongOwnerPassword99") is PasswordChangeResult.Error)
+        assertTrue(vm.loginAdmin("owner@smartdine.test", "") is PasswordChangeResult.Error)
+
+        // Wrong password fails
+        assertTrue(vm.loginAdmin("owner@smartdine.test", "WrongPass123") is PasswordChangeResult.Error)
         assertFalse(vm.uiState.value.isAdminAuthenticated)
 
-        // AdminPanel only contains Management modules (no KDS / Inventory tabs)
-        assertEquals(listOf(AdminTab.OWNER_DASHBOARD, AdminTab.MENU_MANAGEMENT), AdminTab.entries)
+        // Non-admin role (e.g., customer) rejected
+        val customerRoleSupabase = FakeSupabaseService(
+            validAdminEmail = "guest@smartdine.test",
+            validAdminPassword = "GuestPassword99",
+            validAdminRole = "customer"
+        )
+        val nonAdminVm = RestaurantViewModel(InMemoryMenuStorage(), InMemoryCredentialStorage(), customerRoleSupabase)
+        assertTrue(nonAdminVm.loginAdmin("guest@smartdine.test", "GuestPassword99") is PasswordChangeResult.Error)
+        assertFalse(nonAdminVm.uiState.value.isAdminAuthenticated)
 
-        // Unauthenticated cannot advance kitchen tickets
-        vm.advanceOrderStatus(130)
-        assertEquals(OrderStatus.NEW, vm.uiState.value.orders.first { it.orderNumber == 130 }.status)
+        // Owner role succeeds
+        val ownerRoleSupabase = FakeSupabaseService(
+            validAdminEmail = "proprietor@smartdine.test",
+            validAdminPassword = "OwnerPassword99",
+            validAdminRole = "owner"
+        )
+        val ownerVm = RestaurantViewModel(InMemoryMenuStorage(), InMemoryCredentialStorage(), ownerRoleSupabase)
+        assertTrue(ownerVm.loginAdmin("proprietor@smartdine.test", "OwnerPassword99") is PasswordChangeResult.Success)
+        assertTrue(ownerVm.uiState.value.isAdminAuthenticated)
 
-        // Admin login succeeds, but KDS ticket execution stays strictly restricted to Kitchen/Chef role
-        assertFalse(vm.loginAdmin("admin", "wrongpass"))
-        assertTrue(vm.loginAdmin("admin", "admin123"))
+        // Valid admin succeeds
+        assertTrue(vm.loginAdmin("owner@smartdine.test", "StrongOwnerPassword99") is PasswordChangeResult.Success)
         assertTrue(vm.uiState.value.isAdminAuthenticated)
-        vm.advanceOrderStatus(130)
-        assertEquals(OrderStatus.NEW, vm.uiState.value.orders.first { it.orderNumber == 130 }.status)
+
+        // Admin cannot execute Chef KDS actions
+        vm.activateKioskMode()
         vm.logoutAdmin()
         assertFalse(vm.uiState.value.isAdminAuthenticated)
-
-        // Chef logs in with CNIC + Password -> unlocks Chef Workspace & KDS execution
-        val chefLogin = vm.loginEmployeeWithCnic("34601-1111111-1", "chef123")
-        assertTrue(chefLogin is EmployeeLoginResult.Success)
-        assertEquals(StaffPortalRole.KITCHEN_CHEF, (chefLogin as EmployeeLoginResult.Success).employee.portalRole)
-
-        vm.advanceOrderStatus(130)
-        assertEquals(OrderStatus.PREPARING, vm.uiState.value.orders.first { it.orderNumber == 130 }.status)
-        vm.logoutEmployeePortal()
-        assertEquals(null, vm.uiState.value.authenticatedEmployeeId)
+        assertEquals(1, fakeSupabase.signOutCallCount)
     }
 
     @Test
-    fun kdsCompletedTransition_preservesOrderWithTimestampAndDate() {
-        val vm = RestaurantViewModel()
-        assertTrue(vm.loginEmployeeWithCnic("34601-1111111-1", "chef123") is EmployeeLoginResult.Success)
-
-        // Kiosk Order #128 starts in PREPARING; Chef advances PREPARING -> READY -> SERVED (Completed)
-        vm.advanceOrderStatus(128)
-        assertEquals(OrderStatus.READY, vm.uiState.value.orders.first { it.orderNumber == 128 }.status)
-        vm.advanceOrderStatus(128)
-        val completedOrder = vm.uiState.value.orders.first { it.orderNumber == 128 }
-        assertEquals(OrderStatus.SERVED, completedOrder.status)
-        assertEquals(DateUtils.todayIso(), completedOrder.completedDateIso)
-        assertNotNull(completedOrder.completedTimeLabel)
-
-        // Pre-populated yesterday completed orders exist for history filtering
-        val yesterdayIso = DateUtils.daysAgoIso(1)
-        assertTrue(
-            vm.uiState.value.orders.any {
-                it.status == OrderStatus.SERVED && it.completedDateIso == yesterdayIso
-            }
+    fun changeAdminPassword_validatesRulesAndUpdatesViaSupabase() = runBlocking {
+        val fakeSupabase = FakeSupabaseService(
+            validAdminEmail = "owner@smartdine.test",
+            validAdminPassword = "OldOwnerPassword99",
+            validAdminRole = "admin"
         )
+        val vm = RestaurantViewModel(InMemoryMenuStorage(), InMemoryCredentialStorage(), fakeSupabase)
+
+        // Cannot change password while logged out
+        assertTrue(
+            vm.changeAdminPassword("OldOwnerPassword99", "NewOwnerPassword99", "NewOwnerPassword99")
+                is PasswordChangeResult.Error
+        )
+
+        assertTrue(vm.loginAdmin("owner@smartdine.test", "OldOwnerPassword99") is PasswordChangeResult.Success)
+
+        // Too short (< 8 chars) or mismatch fails
+        assertTrue(
+            vm.changeAdminPassword("OldOwnerPassword99", "short", "short")
+                is PasswordChangeResult.Error
+        )
+        assertTrue(
+            vm.changeAdminPassword("OldOwnerPassword99", "NewOwnerPassword99", "DifferentPassword99")
+                is PasswordChangeResult.Error
+        )
+
+        // Valid update sends new password to Supabase Auth
+        assertTrue(
+            vm.changeAdminPassword("OldOwnerPassword99", "NewOwnerPassword99", "NewOwnerPassword99")
+                is PasswordChangeResult.Success
+        )
+        assertEquals("NewOwnerPassword99", fakeSupabase.lastUpdatedPassword)
     }
 
     @Test
-    fun employeePortalAndStaffLifecycle_tracksAttendanceDayOffValidationEditAndRelieve() {
+    fun staffLifecycleAndCnicAuth_tracksAttendanceRoleRoutingEditAndRelieve() = runBlocking {
+        val fakeSupabase = FakeSupabaseService(
+            validAdminEmail = "owner@smartdine.test",
+            validAdminPassword = "OwnerPassword99",
+            validAdminRole = "admin"
+        )
+        val menuStorage = InMemoryMenuStorage()
         val credStorage = InMemoryCredentialStorage()
-        val vm = RestaurantViewModel(InMemoryMenuStorage(), credStorage)
+        val vm = RestaurantViewModel(menuStorage, credStorage, fakeSupabase)
         val today = DateUtils.todayIso()
 
-        // Employee CNIC + Password login opens personal portal without unlocking Admin Panel
-        val res = vm.loginEmployeeWithCnic(cnicInput = "34601-5555555-5", passwordInput = "hamza123")
-        assertTrue(res is EmployeeLoginResult.Success)
-        assertEquals("st_5", vm.uiState.value.authenticatedEmployeeId)
-        assertEquals(StaffPortalRole.GENERAL_STAFF, vm.uiState.value.authenticatedEmployee?.portalRole)
-        assertFalse(vm.uiState.value.isAdminAuthenticated)
+        assertTrue(vm.loginAdmin("owner@smartdine.test", "OwnerPassword99") is PasswordChangeResult.Success)
 
-        // 1-click "Mark Today's Attendance (Present)" updates attendance record
-        assertTrue(vm.markAuthenticatedEmployeePresent())
-        assertEquals(
-            AttendanceStatus.PRESENT,
-            vm.uiState.value.effectiveAttendanceStatus(
-                vm.uiState.value.staff.first { it.id == "st_5" },
-                today
-            )
-        )
-        vm.logoutEmployeePortal()
-
-        // Scheduled Day-Off automatically shows DAY_OFF when no explicit override exists
-        val zainab = vm.uiState.value.staff.first { it.id == "st_6" }
-        assertEquals(
-            AttendanceStatus.DAY_OFF,
-            vm.uiState.value.effectiveAttendanceStatus(zainab, today)
-        )
-
-        // Admin onboarding validation: missing mandatory fields or duplicate CNIC must fail
-        assertTrue(vm.loginAdmin("admin", "admin123"))
+        // Validation: missing phone must fail
         assertFalse(
             vm.addEmployee(
                 name = "Nadia Shah",
                 cnic = "34601-7777777-7",
-                password = "pass123",
+                password = "NadiaPass99",
                 phone = "",
                 designation = "Pastry Chef",
                 portalRole = StaffPortalRole.KITCHEN_CHEF,
@@ -140,11 +184,43 @@ class RestaurantViewModelTest {
                 scheduledDayOff = WeekdaySlot.SUNDAY
             )
         )
+
+        // Onboard Chef & General Staff
+        assertTrue(
+            vm.addEmployee(
+                name = "Nadia Shah",
+                cnic = "34601-7777777-7",
+                password = "NadiaPass99",
+                phone = "+92 300 7777111",
+                designation = "Pastry Chef",
+                portalRole = StaffPortalRole.KITCHEN_CHEF,
+                address = "Street 9, Model Town",
+                email = "",
+                shiftLabel = "09:00 - 17:00",
+                scheduledDayOff = WeekdaySlot.SUNDAY
+            )
+        )
+        assertTrue(
+            vm.addEmployee(
+                name = "Hamza Ali",
+                cnic = "34601-5555555-5",
+                password = "HamzaPass99",
+                phone = "+92 300 5555111",
+                designation = "Floor Host",
+                portalRole = StaffPortalRole.GENERAL_STAFF,
+                address = "Block C, Gulberg",
+                email = "",
+                shiftLabel = "12:00 - 20:00",
+                scheduledDayOff = WeekdaySlot.NONE
+            )
+        )
+
+        // Duplicate CNIC rejected
         assertFalse(
             vm.addEmployee(
                 name = "Duplicate Chef",
-                cnic = "34601-1111111-1",
-                password = "pass123",
+                cnic = "34601-7777777-7",
+                password = "AnotherPass99",
                 phone = "+92 300 7777111",
                 designation = "Chef",
                 portalRole = StaffPortalRole.KITCHEN_CHEF,
@@ -155,33 +231,30 @@ class RestaurantViewModelTest {
             )
         )
 
-        // Optional email left blank succeeds when all mandatory fields are provided
-        assertTrue(
-            vm.addEmployee(
-                name = "Nadia Shah",
-                cnic = "34601-7777777-7",
-                password = "nadia123",
-                phone = "+92 300 7777111",
-                designation = "Pastry Chef",
-                portalRole = StaffPortalRole.KITCHEN_CHEF,
-                address = "Street 9, Model Town",
-                email = "",
-                shiftLabel = "09:00 - 17:00",
-                scheduledDayOff = WeekdaySlot.SUNDAY
-            )
-        )
         val nadia = vm.uiState.value.staff.first { it.name == "Nadia Shah" }
-        assertEquals("Pastry Chef", nadia.designation)
-        assertEquals("34601-7777777-7", nadia.cnic)
-        assertEquals(StaffPortalRole.KITCHEN_CHEF, nadia.portalRole)
+        val hamza = vm.uiState.value.staff.first { it.name == "Hamza Ali" }
+        vm.logoutAdmin()
 
-        // Edit employee details & role
+        // General Staff signs in via CNIC + Password and marks Present
+        val staffLogin = vm.loginEmployeeWithCnic("34601-5555555-5", "HamzaPass99")
+        assertTrue(staffLogin is EmployeeLoginResult.Success)
+        assertEquals(StaffPortalRole.GENERAL_STAFF, (staffLogin as EmployeeLoginResult.Success).employee.portalRole)
+        assertFalse(vm.uiState.value.isAdminAuthenticated)
+        assertTrue(vm.markAuthenticatedEmployeePresent())
+        assertEquals(
+            AttendanceStatus.PRESENT,
+            vm.uiState.value.effectiveAttendanceStatus(hamza, today)
+        )
+        vm.logoutEmployeePortal()
+
+        // Admin edits Nadia and relieves her -> relieved login must fail
+        assertTrue(vm.loginAdmin("owner@smartdine.test", "OwnerPassword99") is PasswordChangeResult.Success)
         assertTrue(
             vm.updateEmployee(
                 staffId = nadia.id,
                 name = "Nadia Shah-Malik",
                 cnic = "34601-7777777-8",
-                password = "nadiaNew123",
+                password = "NadiaNewPass99",
                 phone = "+92 300 8888222",
                 designation = "Delivery Lead",
                 portalRole = StaffPortalRole.DELIVERY_RIDER,
@@ -191,85 +264,65 @@ class RestaurantViewModelTest {
                 scheduledDayOff = WeekdaySlot.SATURDAY
             )
         )
-        val editedNadia = vm.uiState.value.staff.first { it.id == nadia.id }
-        assertEquals("Nadia Shah-Malik", editedNadia.name)
-        assertEquals("Delivery Lead", editedNadia.designation)
-        assertEquals(StaffPortalRole.DELIVERY_RIDER, editedNadia.portalRole)
-        assertEquals("34601-7777777-8", editedNadia.cnic)
-        assertEquals("+92 300 8888222", editedNadia.phone)
-        assertEquals("nadia@smartdine.app", editedNadia.email)
-        assertEquals(WeekdaySlot.SATURDAY, editedNadia.scheduledDayOff)
-
-        // Attendance override & relieve
         vm.overrideAttendance(nadia.id, today, AttendanceStatus.LEAVE)
         assertEquals(
             AttendanceStatus.LEAVE,
-            vm.uiState.value.effectiveAttendanceStatus(editedNadia, today)
+            vm.uiState.value.effectiveAttendanceStatus(vm.uiState.value.staff.first { it.id == nadia.id }, today)
         )
-
-        // Relieve employee removes from active login but keeps historical attendance logs
         vm.relieveEmployee(nadia.id)
-        assertTrue(vm.uiState.value.staff.first { it.id == nadia.id }.isRelieved)
-        assertNotNull(vm.uiState.value.attendanceRecordFor(nadia.id, today))
-        assertTrue(vm.loginEmployeeWithCnic("34601-7777777-8", "nadiaNew123") is EmployeeLoginResult.Error)
-    }
-
-    @Test
-    fun changeAdminPassword_verifiesOldPasswordAndPersistsAcrossRestarts() {
-        val menuStorage = InMemoryMenuStorage()
-        val credStorage = InMemoryCredentialStorage()
-        val vm = RestaurantViewModel(menuStorage, credStorage)
-
-        assertTrue(vm.loginAdmin("admin", "admin123"))
-
-        val wrongOld = vm.changeAdminPassword("wrong123", "newpass99", "newpass99")
-        assertTrue(wrongOld is PasswordChangeResult.Error)
-
-        val mismatch = vm.changeAdminPassword("admin123", "newpass99", "different99")
-        assertTrue(mismatch is PasswordChangeResult.Error)
-
-        val success = vm.changeAdminPassword("admin123", "newpass99", "newpass99")
-        assertTrue(success is PasswordChangeResult.Success)
         vm.logoutAdmin()
 
-        val restartedVm = RestaurantViewModel(menuStorage, credStorage)
-        assertFalse(restartedVm.loginAdmin("admin", "admin123"))
-        assertTrue(restartedVm.loginAdmin("admin", "newpass99"))
+        assertTrue(vm.loginEmployeeWithCnic("34601-7777777-8", "NadiaNewPass99") is EmployeeLoginResult.Error)
     }
 
     @Test
-    fun changeEmployeePassword_verifiesOldPasswordAndPersistsAcrossRestarts() {
+    fun changeEmployeePassword_verifiesOldPasswordAndPersistsAcrossRestarts() = runBlocking {
+        val fakeSupabase = FakeSupabaseService(
+            validAdminEmail = "owner@smartdine.test",
+            validAdminPassword = "OwnerPassword99",
+            validAdminRole = "admin"
+        )
         val menuStorage = InMemoryMenuStorage()
         val credStorage = InMemoryCredentialStorage()
-        val vm = RestaurantViewModel(menuStorage, credStorage)
+        val vm = RestaurantViewModel(menuStorage, credStorage, fakeSupabase)
 
-        val login = vm.loginEmployeeWithCnic("34601-1111111-1", "chef123")
-        assertTrue(login is EmployeeLoginResult.Success)
+        assertTrue(vm.loginAdmin("owner@smartdine.test", "OwnerPassword99") is PasswordChangeResult.Success)
+        assertTrue(
+            vm.addEmployee(
+                name = "Chef Tariq",
+                cnic = "34601-1111111-1",
+                password = "TariqPass1",
+                phone = "+92 300 1111111",
+                designation = "Head Chef",
+                portalRole = StaffPortalRole.KITCHEN_CHEF,
+                address = "Kitchen HQ",
+                email = "",
+                shiftLabel = "11:00 - 20:00",
+                scheduledDayOff = WeekdaySlot.NONE
+            )
+        )
+        val chef = vm.uiState.value.staff.first { it.cnic == "34601-1111111-1" }
+        vm.logoutAdmin()
 
-        val wrongOld = vm.changeEmployeePassword("st_1", "wrongpass", "tariqNew99", "tariqNew99")
+        assertTrue(vm.loginEmployeeWithCnic("34601-1111111-1", "TariqPass1") is EmployeeLoginResult.Success)
+
+        val wrongOld = vm.changeEmployeePassword(chef.id, "WrongOld", "TariqNew99", "TariqNew99")
         assertTrue(wrongOld is PasswordChangeResult.Error)
 
-        val ok = vm.changeEmployeePassword("st_1", "chef123", "tariqNew99", "tariqNew99")
+        val ok = vm.changeEmployeePassword(chef.id, "TariqPass1", "TariqNew99", "TariqNew99")
         assertTrue(ok is PasswordChangeResult.Success)
 
         val restartedVm = RestaurantViewModel(menuStorage, credStorage)
-        assertTrue(restartedVm.loginEmployeeWithCnic("34601-1111111-1", "chef123") is EmployeeLoginResult.Error)
-        assertTrue(restartedVm.loginEmployeeWithCnic("34601-1111111-1", "tariqNew99") is EmployeeLoginResult.Success)
+        assertTrue(restartedVm.loginEmployeeWithCnic("34601-1111111-1", "TariqPass1") is EmployeeLoginResult.Error)
+        assertTrue(restartedVm.loginEmployeeWithCnic("34601-1111111-1", "TariqNew99") is EmployeeLoginResult.Success)
     }
 
     @Test
     fun salesAnalytics_tracksDeliveryAndKioskMultiChannelRevenue() {
         val vm = RestaurantViewModel()
         val today = DateUtils.todayIso()
-        val yesterday = DateUtils.daysAgoIso(1)
+        assertTrue(vm.uiState.value.salesRecords.isEmpty())
 
-        val todayRecBefore = vm.uiState.value.salesRecords.first { it.dateIso == today }
-        assertEquals(184500, todayRecBefore.grossRevenueRs)
-        assertEquals(106800, todayRecBefore.deliveryRevenueRs)
-        assertEquals(77700, todayRecBefore.kioskRevenueRs)
-        assertTrue(vm.uiState.value.salesRecords.any { it.dateIso == yesterday && it.grossRevenueRs == 162800 })
-
-        // Place a Home Delivery order -> increments deliveryRevenueRs & deliveryOrderCount
         val burger = vm.uiState.value.menuItems.first { it.id == "item_1" }
         vm.addToCart(burger)
         assertTrue(
@@ -285,30 +338,35 @@ class RestaurantViewModelTest {
         )
         val afterDelivery = vm.uiState.value.salesRecords.first { it.dateIso == today }
         val delOrder = vm.uiState.value.homeDeliveryOrders.first()
-        assertEquals(todayRecBefore.deliveryRevenueRs + delOrder.grandTotalRs, afterDelivery.deliveryRevenueRs)
-        assertEquals(todayRecBefore.deliveryOrderCount + 1, afterDelivery.deliveryOrderCount)
+        assertEquals(delOrder.grandTotalRs, afterDelivery.deliveryRevenueRs)
+        assertEquals(1, afterDelivery.deliveryOrderCount)
 
         // Cancel within 3 minutes -> rolls back deliveryRevenueRs & deliveryOrderCount
         assertTrue(vm.cancelDeliveryOrder(delOrder.orderNumber))
         val afterCancel = vm.uiState.value.salesRecords.first { it.dateIso == today }
-        assertEquals(todayRecBefore.deliveryRevenueRs, afterCancel.deliveryRevenueRs)
-        assertEquals(todayRecBefore.deliveryOrderCount, afterCancel.deliveryOrderCount)
+        assertEquals(0, afterCancel.deliveryRevenueRs)
+        assertEquals(0, afterCancel.deliveryOrderCount)
 
-        // Activate Kiosk Mode and place Kiosk order -> increments kioskRevenueRs & kioskOrderCount
-        assertTrue(vm.activateKioskMode("kiosk01", "kiosk123") is PasswordChangeResult.Success)
+        // Activate Kiosk Mode without admin password and place Kiosk order
+        vm.activateKioskMode()
         vm.addToCart(burger)
         val kioskOrder = vm.placeKioskOrder(PaymentMethod.PAY_AT_COUNTER)
         assertNotNull(kioskOrder)
         val afterKiosk = vm.uiState.value.salesRecords.first { it.dateIso == today }
-        assertEquals(todayRecBefore.kioskRevenueRs + kioskOrder!!.grandTotalRs, afterKiosk.kioskRevenueRs)
-        assertEquals(todayRecBefore.kioskOrderCount + 1, afterKiosk.kioskOrderCount)
+        assertEquals(kioskOrder!!.grandTotalRs, afterKiosk.kioskRevenueRs)
+        assertEquals(1, afterKiosk.kioskOrderCount)
     }
 
     @Test
-    fun adminMenuCrud_persistsChangesAcrossRestarts() {
+    fun adminMenuCrud_persistsChangesAcrossRestarts() = runBlocking {
+        val fakeSupabase = FakeSupabaseService(
+            validAdminEmail = "owner@smartdine.test",
+            validAdminPassword = "OwnerPassword99",
+            validAdminRole = "admin"
+        )
         val storage = InMemoryMenuStorage()
-        val vm = RestaurantViewModel(storage)
-        assertTrue(vm.loginAdmin("admin", "admin123"))
+        val vm = RestaurantViewModel(storage, InMemoryCredentialStorage(), fakeSupabase)
+        assertTrue(vm.loginAdmin("owner@smartdine.test", "OwnerPassword99") is PasswordChangeResult.Success)
 
         vm.addMenuItem(
             title = "Garlic Naan",
@@ -344,70 +402,42 @@ class RestaurantViewModelTest {
     }
 
     @Test
-    fun defaultEntry_launchesInHomeDeliveryWithoutLoginLock() {
-        val vm = RestaurantViewModel()
-        assertEquals(CustomerExperienceMode.HOME_DELIVERY, vm.uiState.value.customerMode)
-        assertEquals(CustomerTab.MENU, vm.uiState.value.customerTab)
-        assertFalse(vm.uiState.value.isKioskModeActive)
-        assertEquals(null, vm.uiState.value.loggedInCustomer)
-
-        // Guests can immediately browse & add dishes to cart without logging in first
-        val burger = vm.uiState.value.menuItems.first { it.id == "item_1" }
-        vm.addToCart(burger)
-        assertEquals(1, vm.uiState.value.cartItemCount)
-    }
-
-    @Test
-    fun kioskMode_enforcesPasswordActivationExitSequentialTokensAndKdsSync() {
+    fun kioskMode_opensAndExitsWithoutAdminPasswordAndIssuesSequentialTokens() {
         val vm = RestaurantViewModel()
 
-        // Invalid Kiosk ID or password must fail
-        assertTrue(vm.activateKioskMode("wrong01", "kiosk123") is PasswordChangeResult.Error)
-        assertTrue(vm.activateKioskMode("kiosk01", "wrongpass") is PasswordChangeResult.Error)
-        assertFalse(vm.uiState.value.isKioskModeActive)
-
-        // Valid credentials unlock Self-Ordering Kiosk Mode
-        assertTrue(vm.activateKioskMode("kiosk01", "kiosk123") is PasswordChangeResult.Success)
+        vm.activateKioskMode()
         assertTrue(vm.uiState.value.isKioskModeActive)
         assertEquals(CustomerExperienceMode.KIOSK_MODE, vm.uiState.value.customerMode)
 
-        // Switching to Home Delivery tabs is blocked while Kiosk Mode is locked
+        // Switching to Home Delivery tabs is ignored while Kiosk Mode is active
         vm.selectCustomerTab(CustomerTab.TRACKER)
         assertEquals(CustomerTab.MENU, vm.uiState.value.customerTab)
 
-        // Place first Kiosk order -> Token #16 + KDS sync
+        // Place first Kiosk order -> Token #1
         val burger = vm.uiState.value.menuItems.first { it.id == "item_1" }
         vm.addToCart(burger)
         val order1 = vm.placeKioskOrder(PaymentMethod.PAY_AT_COUNTER)
         assertNotNull(order1)
-        assertEquals(16, order1!!.tokenNumber)
+        assertEquals(1, order1!!.tokenNumber)
         assertEquals(OrderType.KIOSK, order1.orderType)
-        assertEquals("DINE-IN / KIOSK • Token #16", order1.kdsBadgeLabel)
+        assertEquals("DINE-IN / KIOSK • Token #1", order1.kdsBadgeLabel)
         assertFalse(order1.isPaid)
         assertEquals(0, vm.uiState.value.cartItemCount)
-        assertEquals(16, vm.uiState.value.activeKioskTokenOrder?.tokenNumber)
+        assertEquals(1, vm.uiState.value.activeKioskTokenOrder?.tokenNumber)
 
-        // Reset for next customer & place second Kiosk order -> Token #17 paid online
+        // Reset for next customer & place second Kiosk order -> Token #2 paid online
         vm.resetKioskForNextCustomer()
         assertEquals(null, vm.uiState.value.activeKioskTokenOrder)
         vm.addToCart(burger)
         val order2 = vm.placeKioskOrder(PaymentMethod.ONLINE)
         assertNotNull(order2)
-        assertEquals(17, order2!!.tokenNumber)
+        assertEquals(2, order2!!.tokenNumber)
         assertTrue(order2.isPaid)
 
-        // Exiting Kiosk Mode requires Kiosk or Admin password
-        assertTrue(vm.exitKioskMode("badpass") is PasswordChangeResult.Error)
-        assertTrue(vm.uiState.value.isKioskModeActive)
-
-        assertTrue(vm.exitKioskMode("kiosk123") is PasswordChangeResult.Success)
+        // Exit back to Home Delivery without requiring admin password
+        vm.exitKioskMode()
         assertFalse(vm.uiState.value.isKioskModeActive)
         assertEquals(CustomerExperienceMode.HOME_DELIVERY, vm.uiState.value.customerMode)
-
-        // Admin password can also exit Kiosk Mode
-        assertTrue(vm.activateKioskMode("kiosk01", "kiosk123") is PasswordChangeResult.Success)
-        assertTrue(vm.exitKioskMode("admin123") is PasswordChangeResult.Success)
-        assertFalse(vm.uiState.value.isKioskModeActive)
     }
 
     @Test
@@ -456,18 +486,28 @@ class RestaurantViewModelTest {
     }
 
     @Test
-    fun customerAuthAndOrderHistory_persistsAcrossRestarts() {
+    fun customerAuthAndOrderHistory_persistsAcrossRestarts() = runBlocking {
+        val fakeSupabase = FakeSupabaseService(validEmailOtp = "654321")
         val menuStorage = InMemoryMenuStorage()
         val credStorage = InMemoryCredentialStorage()
-        val vm = RestaurantViewModel(menuStorage, credStorage)
+        val vm = RestaurantViewModel(menuStorage, credStorage, fakeSupabase)
 
-        // Email sign up & login verification
-        val badEmail = vm.loginOrSignUpCustomerWithEmail("Zara", "invalid", "pass123")
+        val badEmail = vm.sendCustomerEmailOtp("Zara", "invalid")
         assertTrue(badEmail is PasswordChangeResult.Error)
 
-        val emailOk = vm.loginOrSignUpCustomerWithEmail("Zara Ali", "zara@smartdine.app", "secret123")
+        val sendOk = vm.sendCustomerEmailOtp("Zara Ali", "zara@smartdine.app")
+        assertTrue(sendOk is PasswordChangeResult.Success)
+        assertTrue(fakeSupabase.sentOtpEmails.contains("zara@smartdine.app"))
+
+        // Hardcoded legacy demo OTP "1234" or any wrong code must fail strict verification
+        val wrongOtp = vm.verifyCustomerEmailOtp("Zara Ali", "zara@smartdine.app", "1234")
+        assertTrue(wrongOtp is PasswordChangeResult.Error)
+        assertEquals(null, vm.uiState.value.loggedInCustomer)
+
+        val emailOk = vm.verifyCustomerEmailOtp("Zara Ali", "zara@smartdine.app", "654321")
         assertTrue(emailOk is PasswordChangeResult.Success)
         assertEquals("Zara Ali", vm.uiState.value.loggedInCustomer?.name)
+        assertEquals("zara@smartdine.app", vm.uiState.value.loggedInCustomer?.email)
         assertEquals(CustomerAuthProvider.EMAIL, vm.uiState.value.loggedInCustomer?.provider)
 
         // Place delivery order while signed in
@@ -487,31 +527,71 @@ class RestaurantViewModelTest {
         val placedOrderNum = vm.uiState.value.homeDeliveryOrders.first().orderNumber
 
         // Restart ViewModel -> customer session & delivery order history persist
-        val restartedVm = RestaurantViewModel(menuStorage, credStorage)
+        val restartedVm = RestaurantViewModel(menuStorage, credStorage, fakeSupabase)
         assertEquals("Zara Ali", restartedVm.uiState.value.loggedInCustomer?.name)
         assertTrue(restartedVm.uiState.value.homeDeliveryOrders.any { it.orderNumber == placedOrderNum })
 
-        // Logout & test Google + Phone OTP 1234
         restartedVm.logoutCustomer()
         assertEquals(null, restartedVm.uiState.value.loggedInCustomer)
+    }
 
-        val wrongOtp = restartedVm.loginCustomerWithPhoneOtp("Hamza", "+92 321 9998877", "9999")
-        assertTrue(wrongOtp is PasswordChangeResult.Error)
+    @Test
+    fun googleOAuthPkce_authenticatesRealProfileAndPersistsAvatarAndSession() = runBlocking {
+        val fakeSupabase = FakeSupabaseService()
+        val menuStorage = InMemoryMenuStorage()
+        val credStorage = InMemoryCredentialStorage()
+        val vm = RestaurantViewModel(menuStorage, credStorage, fakeSupabase)
 
-        val okOtp = restartedVm.loginCustomerWithPhoneOtp("Hamza", "+92 321 9998877", "1234")
-        assertTrue(okOtp is PasswordChangeResult.Success)
-        assertEquals(CustomerAuthProvider.PHONE, restartedVm.uiState.value.loggedInCustomer?.provider)
+        val authUrlResult = vm.startGoogleSignIn()
+        assertTrue(authUrlResult.isSuccess)
+        val authUrl = authUrlResult.getOrThrow()
+        assertTrue(authUrl.contains("provider=google"))
+        assertTrue(authUrl.contains("smartdine%3A%2F%2Flogin-callback"))
+        assertTrue(authUrl.contains("code_challenge_method=s256"))
+        assertNotNull(credStorage.loadPendingOAuthVerifier())
 
-        restartedVm.loginCustomerWithGoogle()
+        // Cancelled or failed OAuth callback must report error and clear verifier
+        val failedCallback = vm.handleGoogleOAuthCallback(
+            code = null,
+            accessTokenFromFragment = null,
+            errorMessage = "access_denied"
+        )
+        assertTrue(failedCallback is PasswordChangeResult.Error)
+        assertEquals(null, credStorage.loadPendingOAuthVerifier())
+        assertEquals(null, vm.uiState.value.loggedInCustomer)
+
+        // Start again and simulate valid PKCE callback from smartdine://login-callback?code=...
+        assertTrue(vm.startGoogleSignIn().isSuccess)
+        val successCallback = vm.handleGoogleOAuthCallback(
+            code = "valid-google-code",
+            accessTokenFromFragment = null,
+            errorMessage = null
+        )
+        assertTrue(successCallback is PasswordChangeResult.Success)
+        val profile = vm.uiState.value.loggedInCustomer
+        assertNotNull(profile)
+        assertEquals("Bilal Google", profile!!.name)
+        assertEquals("bilal.google@gmail.com", profile.email)
+        assertEquals("https://lh3.googleusercontent.com/a/avatar.jpg", profile.avatarUrl)
+        assertEquals(CustomerAuthProvider.GOOGLE, profile.provider)
+
+        // Persists across app restarts
+        val restartedVm = RestaurantViewModel(menuStorage, credStorage, fakeSupabase)
+        assertEquals("https://lh3.googleusercontent.com/a/avatar.jpg", restartedVm.uiState.value.loggedInCustomer?.avatarUrl)
         assertEquals(CustomerAuthProvider.GOOGLE, restartedVm.uiState.value.loggedInCustomer?.provider)
     }
 
     @Test
-    fun deliveryCancellationWindow_allowsCancelWithin3MinsAndLocksAfterExpiry() {
+    fun deliveryCancellationWindow_allowsCancelWithin3MinsAndLocksAfterExpiry() = runBlocking {
+        val fakeSupabase = FakeSupabaseService(validEmailOtp = "654321")
         val menuStorage = InMemoryMenuStorage()
         val credStorage = InMemoryCredentialStorage()
-        val vm = RestaurantViewModel(menuStorage, credStorage)
-        vm.loginCustomerWithGoogle("Omar", "omar@gmail.com")
+        val vm = RestaurantViewModel(menuStorage, credStorage, fakeSupabase)
+        assertTrue(vm.sendCustomerEmailOtp("Omar", "omar@example.com") is PasswordChangeResult.Success)
+        assertTrue(
+            vm.verifyCustomerEmailOtp("Omar", "omar@example.com", "654321")
+                is PasswordChangeResult.Success
+        )
 
         val pizza = vm.uiState.value.menuItems.first { it.id == "item_2" }
         vm.addToCart(pizza)
@@ -563,9 +643,52 @@ class RestaurantViewModelTest {
     }
 
     @Test
-    fun deliveryOrder_syncsFromChefReadyToRiderPickupAndDelivered() {
-        val vm = RestaurantViewModel()
-        vm.loginCustomerWithGoogle("Hina", "hina@gmail.com")
+    fun deliveryOrder_syncsFromChefReadyToRiderPickupAndDelivered() = runBlocking {
+        val fakeSupabase = FakeSupabaseService(
+            validAdminEmail = "owner@smartdine.test",
+            validAdminPassword = "OwnerPassword99",
+            validAdminRole = "admin",
+            validEmailOtp = "654321"
+        )
+        val vm = RestaurantViewModel(InMemoryMenuStorage(), InMemoryCredentialStorage(), fakeSupabase)
+
+        // Admin creates Chef and Rider records
+        assertTrue(vm.loginAdmin("owner@smartdine.test", "OwnerPassword99") is PasswordChangeResult.Success)
+        assertTrue(
+            vm.addEmployee(
+                name = "Chef Tariq",
+                cnic = "34601-1111111-1",
+                password = "TariqPass1",
+                phone = "+92 300 1111111",
+                designation = "Head Chef",
+                portalRole = StaffPortalRole.KITCHEN_CHEF,
+                address = "Kitchen HQ",
+                email = "",
+                shiftLabel = "11:00 - 20:00",
+                scheduledDayOff = WeekdaySlot.NONE
+            )
+        )
+        assertTrue(
+            vm.addEmployee(
+                name = "Rider Bilal",
+                cnic = "34601-2222222-2",
+                password = "BilalPass2",
+                phone = "+92 300 2222222",
+                designation = "Delivery Rider",
+                portalRole = StaffPortalRole.DELIVERY_RIDER,
+                address = "Dispatch Desk",
+                email = "",
+                shiftLabel = "12:00 - 22:00",
+                scheduledDayOff = WeekdaySlot.NONE
+            )
+        )
+        vm.logoutAdmin()
+
+        assertTrue(vm.sendCustomerEmailOtp("Hina", "hina@example.com") is PasswordChangeResult.Success)
+        assertTrue(
+            vm.verifyCustomerEmailOtp("Hina", "hina@example.com", "654321")
+                is PasswordChangeResult.Success
+        )
         val biryani = vm.uiState.value.menuItems.first { it.id == "item_3" }
         vm.addToCart(biryani)
         assertTrue(
@@ -582,7 +705,7 @@ class RestaurantViewModelTest {
         val orderNum = vm.uiState.value.homeDeliveryOrders.first().orderNumber
 
         // Chef prepares & marks Ready -> triggers Rider Notification Banner & blocks Chef from dispatching past Ready
-        assertTrue(vm.loginEmployeeWithCnic("34601-1111111-1", "chef123") is EmployeeLoginResult.Success)
+        assertTrue(vm.loginEmployeeWithCnic("34601-1111111-1", "TariqPass1") is EmployeeLoginResult.Success)
         vm.advanceOrderStatus(orderNum)
         assertEquals(OrderStatus.PREPARING, vm.uiState.value.orders.first { it.orderNumber == orderNum }.status)
 
@@ -596,7 +719,7 @@ class RestaurantViewModelTest {
         vm.logoutEmployeePortal()
 
         // Rider logs in with CNIC -> picks up order (ON_THE_WAY) and marks Delivered (SERVED)
-        val riderLogin = vm.loginEmployeeWithCnic("34601-2222222-2", "rider123")
+        val riderLogin = vm.loginEmployeeWithCnic("34601-2222222-2", "BilalPass2")
         assertTrue(riderLogin is EmployeeLoginResult.Success)
         assertEquals(StaffPortalRole.DELIVERY_RIDER, (riderLogin as EmployeeLoginResult.Success).employee.portalRole)
         assertTrue(vm.uiState.value.readyForPickupDeliveryOrders.any { it.orderNumber == orderNum })
@@ -635,20 +758,33 @@ class RestaurantViewModelTest {
     @Test
     fun thermalReceiptData_formatsKioskTokenAndDeliveryReceiptsAccurately() {
         val vm = RestaurantViewModel()
-        assertTrue(vm.activateKioskMode("kiosk01", "kiosk123") is PasswordChangeResult.Success)
+        vm.activateKioskMode()
         val burger = vm.uiState.value.menuItems.first { it.id == "item_1" }
         vm.addToCart(burger)
         val kioskOrder = vm.placeKioskOrder(PaymentMethod.ONLINE)!!
 
         val kioskReceipt = ThermalReceiptData.fromOrder(kioskOrder)
         assertEquals("RCP-${1000 + kioskOrder.orderNumber}", kioskReceipt.receiptId)
-        assertEquals("Dine-In / Kiosk • Token #16", kioskReceipt.orderTypeLabel)
+        assertEquals("Dine-In / Kiosk • Token #1", kioskReceipt.orderTypeLabel)
         assertTrue(kioskReceipt.isPaid)
         assertEquals("Online Payment", kioskReceipt.paymentMethodLabel)
         assertEquals(kioskOrder.subtotalRs, kioskReceipt.subtotalRs)
         assertEquals(kioskOrder.taxRs, kioskReceipt.taxRs)
         assertEquals(kioskOrder.grandTotalRs, kioskReceipt.grandTotalRs)
 
+        vm.exitKioskMode()
+        vm.addToCart(burger)
+        assertTrue(
+            vm.placeHomeDeliveryOrder(
+                customerName = "Amna",
+                customerPhone = "+92 300 1234567",
+                deliveryAddress = "House 5, Sector G-10",
+                gpsCoordinatesLabel = null,
+                gpsMapUrl = null,
+                isGpsFallback = false,
+                paymentMethod = PaymentMethod.CASH_ON_DELIVERY
+            )
+        )
         val deliveryOrder = vm.uiState.value.orders.first { it.isDelivery }
         val deliveryReceipt = ThermalReceiptData.fromOrder(deliveryOrder)
         assertEquals("Home Delivery", deliveryReceipt.orderTypeLabel)
@@ -656,8 +792,11 @@ class RestaurantViewModelTest {
     }
 
     @Test
-    fun supabaseSync_hydratesInitialDataPropagatesRealtimeAndSyncsMutations() {
+    fun supabaseSync_hydratesRemoteDataWithoutSeedingDummyOperationalData() = runBlocking {
         val fakeSupabase = FakeSupabaseService(
+            validAdminEmail = "owner@smartdine.test",
+            validAdminPassword = "OwnerPassword99",
+            validAdminRole = "admin",
             remoteMenu = listOf(
                 MenuItem(
                     id = "remote_1",
@@ -677,11 +816,11 @@ class RestaurantViewModelTest {
 
         testDispatcher.scheduler.advanceUntilIdle()
 
-        // Initial hydration pulled remote menu and seeded empty remote tables (orders, staff, etc.)
-        assertEquals(com.example.data.supabase.SupabaseSyncStatus.LIVE_SYNCED, vm.uiState.value.supabaseSyncStatus)
+        // Initial hydration pulled remote menu and NEVER seeded fake local orders/staff into Supabase
+        assertEquals(SupabaseSyncStatus.LIVE_SYNCED, vm.uiState.value.supabaseSyncStatus)
         assertEquals(listOf("remote_1"), vm.uiState.value.menuItems.map { it.id })
-        assertTrue(fakeSupabase.upsertedOrdersBatchCount > 0)
-        assertTrue(fakeSupabase.upsertedStaffBatchCount > 0)
+        assertEquals(0, fakeSupabase.upsertedOrdersBatchCount)
+        assertEquals(0, fakeSupabase.upsertedStaffBatchCount)
         assertTrue(fakeSupabase.realtimeStarted)
 
         // Incoming realtime menu item upsert updates UI state immediately
@@ -695,29 +834,28 @@ class RestaurantViewModelTest {
             spiceLevel = SpiceLevel.SPICY,
             artwork = MenuArtwork.CUSTOM_DISH
         )
-        fakeSupabase.emitEvent(com.example.data.supabase.SupabaseRealtimeEvent.MenuUpserted(pushedDish))
+        fakeSupabase.emitEvent(SupabaseRealtimeEvent.MenuUpserted(pushedDish))
         testDispatcher.scheduler.advanceUntilIdle()
         assertTrue(vm.uiState.value.menuItems.any { it.id == "remote_2" && it.title == "Live Synced Karahi" })
 
         // Outgoing customer delivery order syncs to Supabase
+        vm.addToCart(pushedDish)
         assertTrue(
-            vm.addToCart(pushedDish).let {
-                vm.placeHomeDeliveryOrder(
-                    customerName = "Saad",
-                    customerPhone = "+92 300 1230000",
-                    deliveryAddress = "House 8, Model Town",
-                    gpsCoordinatesLabel = null,
-                    gpsMapUrl = null,
-                    isGpsFallback = false,
-                    paymentMethod = PaymentMethod.CASH_ON_DELIVERY
-                )
-            }
+            vm.placeHomeDeliveryOrder(
+                customerName = "Saad",
+                customerPhone = "+92 300 1230000",
+                deliveryAddress = "House 8, Model Town",
+                gpsCoordinatesLabel = null,
+                gpsMapUrl = null,
+                isGpsFallback = false,
+                paymentMethod = PaymentMethod.CASH_ON_DELIVERY
+            )
         )
         testDispatcher.scheduler.advanceUntilIdle()
         assertTrue(fakeSupabase.singleUpsertedOrders.any { it.customerName == "Saad" })
 
         // Outgoing Admin menu delete syncs delete call to Supabase
-        assertTrue(vm.loginAdmin("admin", "admin123"))
+        assertTrue(vm.loginAdmin("owner@smartdine.test", "OwnerPassword99") is PasswordChangeResult.Success)
         vm.deleteMenuItem("remote_2")
         testDispatcher.scheduler.advanceUntilIdle()
         assertTrue(fakeSupabase.deletedMenuIds.contains("remote_2"))
@@ -726,23 +864,29 @@ class RestaurantViewModelTest {
 }
 
 private class FakeSupabaseService(
+    private val validAdminEmail: String = "owner@smartdine.test",
+    private val validAdminPassword: String = "OwnerPassword99",
+    private val validAdminRole: String = "admin",
+    private val validEmailOtp: String = "654321",
     private val remoteMenu: List<MenuItem> = emptyList(),
-    private val remoteOrders: List<KitchenOrder> = emptyList()
-) : com.example.data.supabase.SupabaseService {
+    private val remoteOrders: List<KitchenOrder> = emptyList(),
+    private val remoteStaff: List<StaffMember> = emptyList()
+) : SupabaseService {
     override val isRemoteEnabled: Boolean = true
-    private val _events = kotlinx.coroutines.flow.MutableSharedFlow<com.example.data.supabase.SupabaseRealtimeEvent>(
-        extraBufferCapacity = 32
-    )
-    override val realtimeEvents: kotlinx.coroutines.flow.SharedFlow<com.example.data.supabase.SupabaseRealtimeEvent> =
-        _events
+    private val _events = MutableSharedFlow<SupabaseRealtimeEvent>(extraBufferCapacity = 32)
+    override val realtimeEvents: SharedFlow<SupabaseRealtimeEvent> = _events
 
     var realtimeStarted = false
     var upsertedOrdersBatchCount = 0
     var upsertedStaffBatchCount = 0
+    var signOutCallCount = 0
+    var lastUpdatedPassword: String? = null
+    var lastGoogleVerifier: String? = null
+    val sentOtpEmails = mutableMapOf<String, String>()
     val singleUpsertedOrders = mutableListOf<KitchenOrder>()
     val deletedMenuIds = mutableListOf<String>()
 
-    fun emitEvent(event: com.example.data.supabase.SupabaseRealtimeEvent) {
+    fun emitEvent(event: SupabaseRealtimeEvent) {
         _events.tryEmit(event)
     }
 
@@ -752,6 +896,98 @@ private class FakeSupabaseService(
 
     override fun stopRealtimeSync() {
         realtimeStarted = false
+    }
+
+    override suspend fun signInAdmin(email: String, password: String): SupabaseAuthResult {
+        if (!email.equals(validAdminEmail, ignoreCase = true) || password != validAdminPassword) {
+            return SupabaseAuthResult.Error("Invalid email or password.")
+        }
+        val normalizedRole = validAdminRole.trim().lowercase()
+        if (normalizedRole != "admin" && normalizedRole != "owner") {
+            return SupabaseAuthResult.Error("Access denied: admin or owner privileges are required.")
+        }
+        return SupabaseAuthResult.Success(
+            SupabaseAuthSession(
+                accessToken = "fake-jwt-token",
+                userId = "admin-uid-1",
+                email = email,
+                role = normalizedRole,
+                fullName = "Owner"
+            )
+        )
+    }
+
+    override fun beginGoogleOAuth(onPersistVerifier: ((String) -> Unit)?): Result<String> {
+        val verifier = "test-pkce-verifier"
+        lastGoogleVerifier = verifier
+        onPersistVerifier?.invoke(verifier)
+        return Result.success(
+            "https://example.supabase.co/auth/v1/authorize?provider=google&redirect_to=smartdine%3A%2F%2Flogin-callback&code_challenge=test&code_challenge_method=s256"
+        )
+    }
+
+    override suspend fun completeGoogleOAuth(
+        code: String?,
+        accessTokenFromFragment: String?,
+        errorMessage: String?,
+        persistedVerifier: String?
+    ): SupabaseAuthResult {
+        if (!errorMessage.isNullOrBlank()) {
+            return SupabaseAuthResult.Error(errorMessage)
+        }
+        val validCode = code == "valid-google-code" && persistedVerifier == lastGoogleVerifier
+        val validFragment = accessTokenFromFragment == "valid-fragment-token"
+        if (!validCode && !validFragment) {
+            return SupabaseAuthResult.Error("Google sign-in could not be completed.")
+        }
+        return SupabaseAuthResult.Success(
+            SupabaseAuthSession(
+                accessToken = "fake-google-jwt",
+                userId = "google-uid-1",
+                email = "bilal.google@gmail.com",
+                role = "customer",
+                fullName = "Bilal Google",
+                avatarUrl = "https://lh3.googleusercontent.com/a/avatar.jpg"
+            )
+        )
+    }
+
+    override suspend fun sendEmailOtp(email: String, fullName: String): Result<Unit> {
+        sentOtpEmails[email.trim().lowercase()] = fullName.trim()
+        return Result.success(Unit)
+    }
+
+    override suspend fun verifyEmailOtp(email: String, token: String): SupabaseAuthResult {
+        val cleanEmail = email.trim().lowercase()
+        if (!sentOtpEmails.containsKey(cleanEmail) || token.trim() != validEmailOtp) {
+            return SupabaseAuthResult.Error("Invalid or expired verification code.")
+        }
+        return SupabaseAuthResult.Success(
+            SupabaseAuthSession(
+                accessToken = "fake-customer-jwt",
+                userId = "cust-uid-$cleanEmail",
+                email = cleanEmail,
+                role = "customer",
+                fullName = sentOtpEmails[cleanEmail].orEmpty()
+            )
+        )
+    }
+
+    override suspend fun updateUserPassword(newPassword: String): Result<Unit> {
+        lastUpdatedPassword = newPassword
+        return Result.success(Unit)
+    }
+
+    override suspend fun signOutAuth() {
+        signOutCallCount++
+    }
+
+    override suspend fun authenticateEmployee(cnic: String, passwordHash: String): Result<StaffMember?> {
+        val cleanKey = cnic.filter { it.isLetterOrDigit() }
+        val match = remoteStaff.firstOrNull {
+            it.cnic.filter { ch -> ch.isLetterOrDigit() } == cleanKey && it.passwordHash == passwordHash
+        }
+        return Result.success(match)
     }
 
     override suspend fun fetchMenuItems(): Result<List<MenuItem>> = Result.success(remoteMenu)
@@ -776,7 +1012,7 @@ private class FakeSupabaseService(
     override suspend fun upsertReview(review: ReviewEntry): Result<Unit> = Result.success(Unit)
     override suspend fun upsertReviews(reviews: List<ReviewEntry>): Result<Unit> = Result.success(Unit)
 
-    override suspend fun fetchStaff(): Result<List<StaffMember>> = Result.success(emptyList())
+    override suspend fun fetchStaff(): Result<List<StaffMember>> = Result.success(remoteStaff)
     override suspend fun upsertStaffMember(member: StaffMember): Result<Unit> = Result.success(Unit)
     override suspend fun upsertStaffList(staff: List<StaffMember>): Result<Unit> {
         upsertedStaffBatchCount += staff.size

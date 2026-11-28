@@ -33,14 +33,14 @@ enum class AppLanguage(val label: String) {
 
 enum class CustomerAuthProvider(val label: String) {
     GOOGLE("Google"),
-    EMAIL("Email"),
-    PHONE("Phone")
+    EMAIL("Email")
 }
 
 data class CustomerProfile(
     val id: String,
     val name: String,
     val email: String = "",
+    val avatarUrl: String = "",
     val phone: String = "",
     val provider: CustomerAuthProvider
 )

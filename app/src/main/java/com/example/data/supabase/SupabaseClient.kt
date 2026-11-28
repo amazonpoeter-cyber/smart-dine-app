@@ -45,6 +45,8 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONArray
 import org.json.JSONObject
+import java.security.MessageDigest
+import java.security.SecureRandom
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -100,12 +102,41 @@ sealed interface SupabaseRealtimeEvent {
     data object SalesRefreshRequested : SupabaseRealtimeEvent
 }
 
+data class SupabaseAuthSession(
+    val accessToken: String,
+    val userId: String,
+    val email: String,
+    val role: String,
+    val fullName: String = "",
+    val avatarUrl: String = ""
+)
+
+sealed interface SupabaseAuthResult {
+    data class Success(val session: SupabaseAuthSession) : SupabaseAuthResult
+    data class Error(val message: String) : SupabaseAuthResult
+}
+
 interface SupabaseService {
     val isRemoteEnabled: Boolean
     val realtimeEvents: SharedFlow<SupabaseRealtimeEvent>
 
     fun startRealtimeSync()
     fun stopRealtimeSync()
+    fun refreshRealtimeAuth() {}
+
+    suspend fun signInAdmin(email: String, password: String): SupabaseAuthResult
+    fun beginGoogleOAuth(onPersistVerifier: ((String) -> Unit)? = null): Result<String>
+    suspend fun completeGoogleOAuth(
+        code: String?,
+        accessTokenFromFragment: String?,
+        errorMessage: String?,
+        persistedVerifier: String? = null
+    ): SupabaseAuthResult
+    suspend fun sendEmailOtp(email: String, fullName: String = ""): Result<Unit>
+    suspend fun verifyEmailOtp(email: String, token: String): SupabaseAuthResult
+    suspend fun updateUserPassword(newPassword: String): Result<Unit>
+    suspend fun signOutAuth()
+    suspend fun authenticateEmployee(cnic: String, passwordHash: String): Result<StaffMember?>
 
     suspend fun fetchMenuItems(): Result<List<MenuItem>>
     suspend fun upsertMenuItem(item: MenuItem): Result<Unit>
@@ -144,6 +175,30 @@ class NoOpSupabaseService : SupabaseService {
 
     override fun startRealtimeSync() {}
     override fun stopRealtimeSync() {}
+
+    override suspend fun signInAdmin(email: String, password: String): SupabaseAuthResult =
+        SupabaseAuthResult.Error("Supabase is not configured.")
+
+    override fun beginGoogleOAuth(onPersistVerifier: ((String) -> Unit)?): Result<String> =
+        Result.failure(IllegalStateException("Supabase is not configured."))
+
+    override suspend fun completeGoogleOAuth(
+        code: String?,
+        accessTokenFromFragment: String?,
+        errorMessage: String?,
+        persistedVerifier: String?
+    ): SupabaseAuthResult = SupabaseAuthResult.Error("Supabase is not configured.")
+
+    override suspend fun sendEmailOtp(email: String, fullName: String): Result<Unit> =
+        Result.failure(IllegalStateException("Supabase is not configured."))
+
+    override suspend fun verifyEmailOtp(email: String, token: String): SupabaseAuthResult =
+        SupabaseAuthResult.Error("Supabase is not configured.")
+
+    override suspend fun updateUserPassword(newPassword: String): Result<Unit> = Result.success(Unit)
+    override suspend fun signOutAuth() {}
+    override suspend fun authenticateEmployee(cnic: String, passwordHash: String): Result<StaffMember?> =
+        Result.success(null)
 
     override suspend fun fetchMenuItems(): Result<List<MenuItem>> = Result.success(emptyList())
     override suspend fun upsertMenuItem(item: MenuItem): Result<Unit> = Result.success(Unit)
@@ -200,6 +255,15 @@ class SupabaseClient(
     @Volatile
     private var webSocket: WebSocket? = null
 
+    @Volatile
+    private var userAccessToken: String? = null
+
+    @Volatile
+    private var currentUserId: String? = null
+
+    @Volatile
+    private var pendingPkceVerifier: String? = null
+
     private var heartbeatJob: Job? = null
     private var reconnectJob: Job? = null
     private var reconnectAttempt = 0
@@ -219,6 +283,23 @@ class SupabaseClient(
         connectWebSocket()
     }
 
+    override fun refreshRealtimeAuth() {
+        if (!isRemoteEnabled || !realtimeWanted) return
+        val ws = webSocket
+        val token = userAccessToken
+        if (ws != null && !token.isNullOrBlank()) {
+            val authMsg = JSONObject().apply {
+                put("topic", REALTIME_TOPIC)
+                put("event", "access_token")
+                put("payload", JSONObject().put("access_token", token))
+                put("ref", refCounter.getAndIncrement().toString())
+            }
+            ws.send(authMsg.toString())
+        } else {
+            connectWebSocket()
+        }
+    }
+
     override fun stopRealtimeSync() {
         realtimeWanted = false
         reconnectJob?.cancel()
@@ -227,6 +308,489 @@ class SupabaseClient(
         heartbeatJob = null
         webSocket?.close(1000, "Client stopped")
         webSocket = null
+    }
+
+    // ---- Supabase Auth & Role Verification ----
+
+    override suspend fun signInAdmin(email: String, password: String): SupabaseAuthResult = withContext(Dispatchers.IO) {
+        if (!isRemoteEnabled) {
+            return@withContext SupabaseAuthResult.Error("Supabase is not configured. Check your Supabase URL and Publishable Key.")
+        }
+        val cleanEmail = email.trim().lowercase()
+        val cleanPassword = password.trim()
+        if (cleanEmail.isBlank() || !cleanEmail.contains("@")) {
+            return@withContext SupabaseAuthResult.Error("Please enter a valid admin email address.")
+        }
+        if (cleanPassword.isEmpty()) {
+            return@withContext SupabaseAuthResult.Error("Please enter your password.")
+        }
+
+        val authResult = passwordSignInRequest(cleanEmail, cleanPassword)
+        val session = when (authResult) {
+            is SupabaseAuthResult.Error -> return@withContext authResult
+            is SupabaseAuthResult.Success -> authResult.session
+        }
+
+        val verifiedRole = verifyAdminOrOwnerRole(
+            accessToken = session.accessToken,
+            userId = session.userId,
+            email = session.email
+        )
+        if (verifiedRole == null) {
+            userAccessToken = null
+            currentUserId = null
+            revokeTokenBestEffort(session.accessToken)
+            return@withContext SupabaseAuthResult.Error(
+                "Access denied. Only accounts with an 'admin' or 'owner' role in Supabase can access the Owner Dashboard."
+            )
+        }
+
+        userAccessToken = session.accessToken
+        currentUserId = session.userId
+        refreshRealtimeAuth()
+        SupabaseAuthResult.Success(session.copy(role = verifiedRole))
+    }
+
+    override fun beginGoogleOAuth(onPersistVerifier: ((String) -> Unit)?): Result<String> {
+        if (!isRemoteEnabled) {
+            return Result.failure(IllegalStateException("Supabase is not configured. Check your Supabase URL and Publishable Key."))
+        }
+        val base = baseHttpUrl ?: return Result.failure(IllegalArgumentException("Invalid Supabase URL."))
+        val randomBytes = ByteArray(32)
+        SecureRandom().nextBytes(randomBytes)
+        val codeVerifier = encodeBase64UrlNoPadding(randomBytes)
+        val challengeDigest = MessageDigest.getInstance("SHA-256")
+            .digest(codeVerifier.toByteArray(Charsets.US_ASCII))
+        val codeChallenge = encodeBase64UrlNoPadding(challengeDigest)
+
+        pendingPkceVerifier = codeVerifier
+        onPersistVerifier?.invoke(codeVerifier)
+
+        val authorizeUrl = base.newBuilder()
+            .addPathSegments("auth/v1/authorize")
+            .addQueryParameter("provider", "google")
+            .addQueryParameter("redirect_to", GOOGLE_OAUTH_REDIRECT_URI)
+            .addQueryParameter("code_challenge", codeChallenge)
+            .addQueryParameter("code_challenge_method", "s256")
+            .build()
+            .toString()
+
+        return Result.success(authorizeUrl)
+    }
+
+    override suspend fun completeGoogleOAuth(
+        code: String?,
+        accessTokenFromFragment: String?,
+        errorMessage: String?,
+        persistedVerifier: String?
+    ): SupabaseAuthResult = withContext(Dispatchers.IO) {
+        if (!isRemoteEnabled) {
+            return@withContext SupabaseAuthResult.Error("Supabase is not configured.")
+        }
+        val base = baseHttpUrl ?: return@withContext SupabaseAuthResult.Error("Invalid Supabase URL.")
+        val cleanError = errorMessage?.trim()?.takeIf { it.isNotBlank() }
+        if (cleanError != null) {
+            pendingPkceVerifier = null
+            return@withContext SupabaseAuthResult.Error(cleanError)
+        }
+
+        val cleanCode = code?.trim()?.takeIf { it.isNotBlank() }
+        val cleanFragmentToken = accessTokenFromFragment?.trim()?.takeIf { it.isNotBlank() }
+
+        if (cleanCode != null) {
+            val verifier = pendingPkceVerifier ?: persistedVerifier?.trim()?.takeIf { it.isNotBlank() }
+            pendingPkceVerifier = null
+            if (verifier.isNullOrBlank()) {
+                return@withContext SupabaseAuthResult.Error("Google sign-in verification expired. Please try again.")
+            }
+            val tokenUrl = base.newBuilder()
+                .addPathSegments("auth/v1/token")
+                .addQueryParameter("grant_type", "pkce")
+                .build()
+            val payload = JSONObject().apply {
+                put("auth_code", cleanCode)
+                put("code_verifier", verifier)
+            }
+            val req = Request.Builder()
+                .url(tokenUrl)
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .header("apikey", config.cleanKey)
+                .header("Content-Type", "application/json")
+                .build()
+
+            return@withContext executeAuthSessionRequest(
+                req = req,
+                fallbackEmail = "",
+                fallbackRole = "customer",
+                defaultError = "Google sign-in could not be completed."
+            )
+        }
+
+        if (cleanFragmentToken != null) {
+            pendingPkceVerifier = null
+            val userUrl = base.newBuilder()
+                .addPathSegments("auth/v1/user")
+                .build()
+            val req = Request.Builder()
+                .url(userUrl)
+                .get()
+                .header("apikey", config.cleanKey)
+                .header("Authorization", "Bearer $cleanFragmentToken")
+                .header("Accept", "application/json")
+                .build()
+
+            return@withContext runCatching {
+                httpClient.newCall(req).execute().use { resp ->
+                    val raw = resp.body?.string().orEmpty()
+                    if (!resp.isSuccessful) {
+                        return@use SupabaseAuthResult.Error(
+                            parseSupabaseError(raw, "Could not verify Google session with Supabase.")
+                        )
+                    }
+                    val userObj = JSONObject(raw)
+                    val session = buildSessionFromUser(
+                        accessToken = cleanFragmentToken,
+                        userObj = userObj,
+                        fallbackEmail = "",
+                        fallbackRole = "customer"
+                    ) ?: return@use SupabaseAuthResult.Error("Invalid user session returned by Supabase.")
+                    userAccessToken = session.accessToken
+                    currentUserId = session.userId
+                    refreshRealtimeAuth()
+                    SupabaseAuthResult.Success(session)
+                }
+            }.getOrElse { err ->
+                SupabaseAuthResult.Error("Network error completing Google Sign-In: ${err.localizedMessage ?: "Check connection"}")
+            }
+        }
+
+        SupabaseAuthResult.Error("No authorization code or token received from Google Sign-In.")
+    }
+
+    override suspend fun sendEmailOtp(email: String, fullName: String): Result<Unit> = withContext(Dispatchers.IO) {
+        if (!isRemoteEnabled) {
+            return@withContext Result.failure(IllegalStateException("Supabase is not configured. Check your Supabase URL and Publishable Key."))
+        }
+        val cleanEmail = email.trim().lowercase()
+        val cleanName = fullName.trim()
+        val base = baseHttpUrl
+            ?: return@withContext Result.failure(IllegalArgumentException("Invalid Supabase URL."))
+
+        val otpUrl = base.newBuilder()
+            .addPathSegments("auth/v1/otp")
+            .build()
+        val payload = JSONObject().apply {
+            put("email", cleanEmail)
+            put("create_user", true)
+            if (cleanName.isNotBlank()) {
+                put("data", JSONObject().put("full_name", cleanName))
+            }
+        }
+        val req = Request.Builder()
+            .url(otpUrl)
+            .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+            .header("apikey", config.cleanKey)
+            .header("Content-Type", "application/json")
+            .build()
+
+        runCatching {
+            httpClient.newCall(req).execute().use { resp ->
+                val raw = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    error(parseSupabaseError(raw, "Unable to send verification code to $cleanEmail."))
+                }
+            }
+        }
+    }
+
+    override suspend fun verifyEmailOtp(email: String, token: String): SupabaseAuthResult = withContext(Dispatchers.IO) {
+        if (!isRemoteEnabled) {
+            return@withContext SupabaseAuthResult.Error("Supabase is not configured.")
+        }
+        val cleanEmail = email.trim().lowercase()
+        val cleanToken = token.trim()
+        val base = baseHttpUrl ?: return@withContext SupabaseAuthResult.Error("Invalid Supabase URL.")
+
+        val verifyUrl = base.newBuilder()
+            .addPathSegments("auth/v1/verify")
+            .build()
+        val payload = JSONObject().apply {
+            put("type", "email")
+            put("email", cleanEmail)
+            put("token", cleanToken)
+        }
+        val req = Request.Builder()
+            .url(verifyUrl)
+            .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+            .header("apikey", config.cleanKey)
+            .header("Content-Type", "application/json")
+            .build()
+
+        executeAuthSessionRequest(
+            req = req,
+            fallbackEmail = cleanEmail,
+            fallbackRole = "customer",
+            defaultError = "Invalid or expired verification code."
+        )
+    }
+
+    private fun executeAuthSessionRequest(
+        req: Request,
+        fallbackEmail: String,
+        fallbackRole: String,
+        defaultError: String
+    ): SupabaseAuthResult {
+        return runCatching {
+            httpClient.newCall(req).execute().use { resp ->
+                val raw = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    return@use SupabaseAuthResult.Error(parseSupabaseError(raw, defaultError))
+                }
+                val json = if (raw.isBlank()) JSONObject() else JSONObject(raw)
+                val accessToken = json.optString("access_token", "")
+                val userObj = json.optJSONObject("user")
+                val session = buildSessionFromUser(
+                    accessToken = accessToken,
+                    userObj = userObj,
+                    fallbackEmail = fallbackEmail,
+                    fallbackRole = fallbackRole
+                ) ?: return@use SupabaseAuthResult.Error("Authentication succeeded without a valid session token.")
+                userAccessToken = session.accessToken
+                currentUserId = session.userId
+                refreshRealtimeAuth()
+                SupabaseAuthResult.Success(session)
+            }
+        }.getOrElse { err ->
+            SupabaseAuthResult.Error("Network error while authenticating: ${err.localizedMessage ?: "Check connection"}")
+        }
+    }
+
+    private fun buildSessionFromUser(
+        accessToken: String,
+        userObj: JSONObject?,
+        fallbackEmail: String,
+        fallbackRole: String
+    ): SupabaseAuthSession? {
+        val userId = userObj?.optString("id", "").orEmpty()
+        if (accessToken.isBlank() || userId.isBlank()) return null
+        val userEmail = userObj?.optString("email", fallbackEmail).orEmpty().ifBlank { fallbackEmail }
+        val meta = userObj?.optJSONObject("user_metadata")
+        val fullName = meta?.optString("full_name", "")?.takeIf { it.isNotBlank() }
+            ?: meta?.optString("name", "")?.takeIf { it.isNotBlank() }
+            ?: ""
+        val rawAvatar = meta?.optString("avatar_url", "")?.takeIf { it.isNotBlank() }
+            ?: meta?.optString("picture", "")?.takeIf { it.isNotBlank() }
+            ?: ""
+        val safeAvatar = SharedPreferencesMenuStorage.sanitizeImageUrl(rawAvatar)
+        return SupabaseAuthSession(
+            accessToken = accessToken,
+            userId = userId,
+            email = userEmail,
+            role = fallbackRole,
+            fullName = fullName,
+            avatarUrl = safeAvatar
+        )
+    }
+
+    override suspend fun updateUserPassword(newPassword: String): Result<Unit> = withContext(Dispatchers.IO) {
+        val token = userAccessToken
+            ?: return@withContext Result.failure(IllegalStateException("Active Supabase admin session required."))
+        val base = baseHttpUrl
+            ?: return@withContext Result.failure(IllegalArgumentException("Invalid Supabase URL"))
+        val url = base.newBuilder()
+            .addPathSegments("auth/v1/user")
+            .build()
+        val body = JSONObject().put("password", newPassword).toString().toRequestBody(JSON_MEDIA_TYPE)
+        val req = Request.Builder()
+            .url(url)
+            .put(body)
+            .header("apikey", config.cleanKey)
+            .header("Authorization", "Bearer $token")
+            .header("Content-Type", "application/json")
+            .build()
+        runCatching {
+            httpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    val raw = resp.body?.string().orEmpty()
+                    error(parseSupabaseError(raw, "Failed to update password."))
+                }
+            }
+        }
+    }
+
+    override suspend fun signOutAuth() {
+        val token = userAccessToken
+        userAccessToken = null
+        currentUserId = null
+        if (!token.isNullOrBlank()) {
+            withContext(Dispatchers.IO) {
+                revokeTokenBestEffort(token)
+            }
+        }
+        refreshRealtimeAuth()
+    }
+
+    override suspend fun authenticateEmployee(cnic: String, passwordHash: String): Result<StaffMember?> =
+        withContext(Dispatchers.IO) {
+            if (!isRemoteEnabled) return@withContext Result.failure(IllegalStateException("Supabase not configured"))
+            val url = restUrlBuilder("rpc/authenticate_staff")?.build()
+                ?: return@withContext Result.failure(IllegalArgumentException("Invalid Supabase URL"))
+            val payload = JSONObject().apply {
+                put("p_cnic", cnic)
+                put("p_password_hash", passwordHash)
+            }
+            val req = Request.Builder()
+                .url(url)
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .header("apikey", config.cleanKey)
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json")
+                .build()
+
+            runCatching {
+                httpClient.newCall(req).execute().use { resp ->
+                    val raw = resp.body?.string().orEmpty()
+                    if (!resp.isSuccessful) {
+                        error("Staff login verification failed (${resp.code})")
+                    }
+                    val arr = if (raw.isBlank()) JSONArray() else JSONArray(raw)
+                    if (arr.length() == 0) null else jsonToStaff(arr.getJSONObject(0))
+                }
+            }
+        }
+
+    private fun passwordSignInRequest(email: String, password: String): SupabaseAuthResult {
+        val base = baseHttpUrl ?: return SupabaseAuthResult.Error("Invalid Supabase URL.")
+        val url = base.newBuilder()
+            .addPathSegments("auth/v1/token")
+            .addQueryParameter("grant_type", "password")
+            .build()
+        val payload = JSONObject().apply {
+            put("email", email)
+            put("password", password)
+        }
+        val req = Request.Builder()
+            .url(url)
+            .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+            .header("apikey", config.cleanKey)
+            .header("Content-Type", "application/json")
+            .build()
+
+        return runCatching {
+            httpClient.newCall(req).execute().use { resp ->
+                val raw = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    val msg = parseSupabaseError(raw, "Invalid email or password.")
+                    return@use SupabaseAuthResult.Error(msg)
+                }
+                val json = JSONObject(raw)
+                val accessToken = json.optString("access_token", "")
+                val userObj = json.optJSONObject("user")
+                val userId = userObj?.optString("id", "").orEmpty()
+                val userEmail = userObj?.optString("email", email).orEmpty()
+                val fullName = userObj?.optJSONObject("user_metadata")?.optString("full_name", "").orEmpty()
+                if (accessToken.isBlank() || userId.isBlank()) {
+                    SupabaseAuthResult.Error("Authentication succeeded without a valid session token.")
+                } else {
+                    SupabaseAuthResult.Success(
+                        SupabaseAuthSession(
+                            accessToken = accessToken,
+                            userId = userId,
+                            email = userEmail,
+                            role = "",
+                            fullName = fullName
+                        )
+                    )
+                }
+            }
+        }.getOrElse { err ->
+            SupabaseAuthResult.Error("Network error while signing in: ${err.localizedMessage ?: "Check internet connection"}")
+        }
+    }
+
+    private fun verifyAdminOrOwnerRole(
+        accessToken: String,
+        userId: String,
+        email: String
+    ): String? {
+        // 1. Check public.profiles table for role = 'admin' or 'owner'
+        val profilesUrl = restUrlBuilder("profiles")
+            ?.addQueryParameter("id", "eq.$userId")
+            ?.addQueryParameter("select", "role")
+            ?.build()
+        if (profilesUrl != null) {
+            val req = Request.Builder()
+                .url(profilesUrl)
+                .get()
+                .header("apikey", config.cleanKey)
+                .header("Authorization", "Bearer $accessToken")
+                .header("Accept", "application/json")
+                .build()
+            val profileRole = runCatching {
+                httpClient.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return@use null
+                    val raw = resp.body?.string().orEmpty()
+                    val arr = if (raw.isBlank()) JSONArray() else JSONArray(raw)
+                    if (arr.length() > 0) arr.getJSONObject(0).optString("role", "").trim().lowercase() else null
+                }
+            }.getOrNull()
+            if (profileRole == "admin" || profileRole == "owner") {
+                return profileRole
+            }
+        }
+
+        // 2. Also check public.staff_members table for portal_role in ('admin', 'owner')
+        val staffUrl = restUrlBuilder(TABLE_STAFF)
+            ?.addQueryParameter("email", "eq.$email")
+            ?.addQueryParameter("select", "portal_role,is_relieved")
+            ?.build()
+        if (staffUrl != null) {
+            val req = Request.Builder()
+                .url(staffUrl)
+                .get()
+                .header("apikey", config.cleanKey)
+                .header("Authorization", "Bearer $accessToken")
+                .header("Accept", "application/json")
+                .build()
+            val staffRole = runCatching {
+                httpClient.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return@use null
+                    val raw = resp.body?.string().orEmpty()
+                    val arr = if (raw.isBlank()) JSONArray() else JSONArray(raw)
+                    if (arr.length() > 0) {
+                        val row = arr.getJSONObject(0)
+                        val relieved = row.optBoolean("is_relieved", false)
+                        val role = row.optString("portal_role", "").trim().lowercase()
+                        if (!relieved && (role == "admin" || role == "owner")) role else null
+                    } else null
+                }
+            }.getOrNull()
+            if (staffRole != null) return staffRole
+        }
+
+        return null
+    }
+
+    private fun revokeTokenBestEffort(accessToken: String) {
+        val base = baseHttpUrl ?: return
+        val logoutUrl = base.newBuilder().addPathSegments("auth/v1/logout").build()
+        val req = Request.Builder()
+            .url(logoutUrl)
+            .post("".toRequestBody(JSON_MEDIA_TYPE))
+            .header("apikey", config.cleanKey)
+            .header("Authorization", "Bearer $accessToken")
+            .build()
+        runCatching { httpClient.newCall(req).execute().close() }
+    }
+
+    private fun parseSupabaseError(raw: String, fallback: String): String {
+        return runCatching {
+            val obj = JSONObject(raw)
+            obj.optString("error_description").takeIf { it.isNotBlank() }
+                ?: obj.optString("msg").takeIf { it.isNotBlank() }
+                ?: obj.optString("message").takeIf { it.isNotBlank() }
+                ?: fallback
+        }.getOrDefault(fallback)
     }
 
     private fun connectWebSocket() {
@@ -312,6 +876,9 @@ class SupabaseClient(
                             put("postgres_changes", postgresChanges)
                         }
                     )
+                    userAccessToken?.takeIf { it.isNotBlank() }?.let { token ->
+                        put("access_token", token)
+                    }
                 }
             )
             put("ref", refCounter.getAndIncrement().toString())
@@ -496,11 +1063,32 @@ class SupabaseClient(
     }
 
     override suspend fun upsertOrder(order: KitchenOrder): Result<Unit> {
-        return upsertRows(
+        val result = upsertRows(
             table = TABLE_ORDERS,
             onConflict = "order_number",
             payload = JSONArray().put(orderToJson(order))
         )
+        if (result.isSuccess && order.items.isNotEmpty()) {
+            // Best-effort sync to normalized order_items table
+            runCatching {
+                deleteWhere(table = TABLE_ORDER_ITEMS, column = "order_number", eqValue = order.orderNumber.toString())
+                val itemsArray = JSONArray()
+                order.items.forEach { line ->
+                    itemsArray.put(
+                        JSONObject().apply {
+                            put("order_number", order.orderNumber)
+                            put("menu_item_id", line.menuItemId)
+                            put("title", line.title)
+                            put("price_rs", line.priceRs)
+                            put("quantity", line.quantity)
+                            put("note", line.note)
+                        }
+                    )
+                }
+                insertRows(table = TABLE_ORDER_ITEMS, payload = itemsArray)
+            }
+        }
+        return result
     }
 
     override suspend fun upsertOrders(orders: List<KitchenOrder>): Result<Unit> {
@@ -670,6 +1258,18 @@ class SupabaseClient(
             .addPathSegment(table)
     }
 
+    private fun restRequestBuilder(url: HttpUrl): Request.Builder {
+        return Request.Builder()
+            .url(url)
+            .header("apikey", config.cleanKey)
+            .apply {
+                val token = userAccessToken
+                if (!token.isNullOrBlank()) {
+                    header("Authorization", "Bearer $token")
+                }
+            }
+    }
+
     private suspend fun <T> getTableRows(
         table: String,
         orderQuery: String,
@@ -682,10 +1282,8 @@ class SupabaseClient(
             ?.build()
             ?: return@withContext Result.failure(IllegalArgumentException("Invalid Supabase URL"))
 
-        val request = Request.Builder()
-            .url(url)
+        val request = restRequestBuilder(url)
             .get()
-            .header("apikey", config.cleanKey)
             .header("Accept", "application/json")
             .build()
 
@@ -713,10 +1311,8 @@ class SupabaseClient(
             ?: return@withContext Result.failure(IllegalArgumentException("Invalid Supabase URL"))
 
         val body = payload.toString().toRequestBody(JSON_MEDIA_TYPE)
-        val request = Request.Builder()
-            .url(url)
+        val request = restRequestBuilder(url)
             .post(body)
-            .header("apikey", config.cleanKey)
             .header("Content-Type", "application/json")
             .header("Prefer", "resolution=merge-duplicates,return=minimal")
             .build()
@@ -726,6 +1322,31 @@ class SupabaseClient(
                 if (!resp.isSuccessful) {
                     val err = resp.body?.string().orEmpty()
                     error("Supabase UPSERT $table failed (${resp.code}): $err")
+                }
+            }
+        }
+    }
+
+    private suspend fun insertRows(
+        table: String,
+        payload: JSONArray
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        if (!isRemoteEnabled) return@withContext Result.failure(IllegalStateException("Supabase not configured"))
+        val url = restUrlBuilder(table)?.build()
+            ?: return@withContext Result.failure(IllegalArgumentException("Invalid Supabase URL"))
+
+        val body = payload.toString().toRequestBody(JSON_MEDIA_TYPE)
+        val request = restRequestBuilder(url)
+            .post(body)
+            .header("Content-Type", "application/json")
+            .header("Prefer", "return=minimal")
+            .build()
+
+        runCatching {
+            httpClient.newCall(request).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    val err = resp.body?.string().orEmpty()
+                    error("Supabase INSERT $table failed (${resp.code}): $err")
                 }
             }
         }
@@ -742,10 +1363,8 @@ class SupabaseClient(
             ?.build()
             ?: return@withContext Result.failure(IllegalArgumentException("Invalid Supabase URL"))
 
-        val request = Request.Builder()
-            .url(url)
+        val request = restRequestBuilder(url)
             .delete()
-            .header("apikey", config.cleanKey)
             .build()
 
         runCatching {
@@ -761,10 +1380,33 @@ class SupabaseClient(
     companion object {
         private const val TAG = "SupabaseClient"
         private const val REALTIME_TOPIC = "realtime:smartdine-sync"
+        const val GOOGLE_OAUTH_REDIRECT_URI = "smartdine://login-callback"
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+        private const val BASE64_URL_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+        internal fun encodeBase64UrlNoPadding(bytes: ByteArray): String {
+            val out = StringBuilder((bytes.size * 4 + 2) / 3)
+            var i = 0
+            while (i < bytes.size) {
+                val b0 = bytes[i].toInt() and 0xFF
+                val b1 = if (i + 1 < bytes.size) bytes[i + 1].toInt() and 0xFF else 0
+                val b2 = if (i + 2 < bytes.size) bytes[i + 2].toInt() and 0xFF else 0
+                out.append(BASE64_URL_ALPHABET[b0 ushr 2])
+                out.append(BASE64_URL_ALPHABET[((b0 and 0x03) shl 4) or (b1 ushr 4)])
+                if (i + 1 < bytes.size) {
+                    out.append(BASE64_URL_ALPHABET[((b1 and 0x0F) shl 2) or (b2 ushr 6)])
+                }
+                if (i + 2 < bytes.size) {
+                    out.append(BASE64_URL_ALPHABET[b2 and 0x3F])
+                }
+                i += 3
+            }
+            return out.toString()
+        }
 
         const val TABLE_MENU_ITEMS = "menu_items"
         const val TABLE_ORDERS = "orders"
+        const val TABLE_ORDER_ITEMS = "order_items"
         const val TABLE_REVIEWS = "reviews"
         const val TABLE_STAFF = "staff_members"
         const val TABLE_ATTENDANCE = "attendance_records"
