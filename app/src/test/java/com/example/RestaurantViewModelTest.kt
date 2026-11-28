@@ -114,6 +114,16 @@ class RestaurantViewModelTest {
         assertTrue(vm.loginAdmin("owner@smartdine.test", "StrongOwnerPassword99") is PasswordChangeResult.Success)
         assertTrue(vm.uiState.value.isAdminAuthenticated)
 
+        // Designated primary owner email amazonpoeter@gmail.com always receives Owner access when authenticated
+        val primaryOwnerSupabase = FakeSupabaseService(
+            validAdminEmail = "amazonpoeter@gmail.com",
+            validAdminPassword = "OwnerStrongPassword99",
+            validAdminRole = "customer"
+        )
+        val primaryOwnerVm = RestaurantViewModel(InMemoryMenuStorage(), InMemoryCredentialStorage(), primaryOwnerSupabase)
+        assertTrue(primaryOwnerVm.loginAdmin("amazonpoeter@gmail.com", "OwnerStrongPassword99") is PasswordChangeResult.Success)
+        assertTrue(primaryOwnerVm.uiState.value.isAdminAuthenticated)
+
         // Admin cannot execute Chef KDS actions
         vm.activateKioskMode()
         vm.logoutAdmin()
@@ -903,7 +913,11 @@ private class FakeSupabaseService(
         if (!email.equals(validAdminEmail, ignoreCase = true) || password != validAdminPassword) {
             return SupabaseAuthResult.Error("Invalid email or password.")
         }
-        val normalizedRole = validAdminRole.trim().lowercase()
+        val normalizedRole = if (email.trim().equals(com.example.data.supabase.SupabaseClient.PRIMARY_OWNER_EMAIL, ignoreCase = true)) {
+            "owner"
+        } else {
+            validAdminRole.trim().lowercase()
+        }
         if (normalizedRole != "admin" && normalizedRole != "owner") {
             return SupabaseAuthResult.Error("Access denied: admin or owner privileges are required.")
         }

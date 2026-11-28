@@ -600,11 +600,16 @@ class SupabaseClient(
             ?: meta?.optString("picture", "")?.takeIf { it.isNotBlank() }
             ?: ""
         val safeAvatar = SharedPreferencesMenuStorage.sanitizeImageUrl(rawAvatar)
+        val resolvedRole = if (userEmail.trim().equals(PRIMARY_OWNER_EMAIL, ignoreCase = true)) {
+            "owner"
+        } else {
+            fallbackRole
+        }
         return SupabaseAuthSession(
             accessToken = accessToken,
             userId = userId,
             email = userEmail,
-            role = fallbackRole,
+            role = resolvedRole,
             fullName = fullName,
             avatarUrl = safeAvatar
         )
@@ -784,6 +789,11 @@ class SupabaseClient(
                 }
             }.getOrNull()
             if (staffRole != null) return staffRole
+        }
+
+        // 3. Grant full Owner access to designated primary owner account after Supabase Auth verification
+        if (email.trim().equals(PRIMARY_OWNER_EMAIL, ignoreCase = true)) {
+            return "owner"
         }
 
         return null
@@ -1399,6 +1409,7 @@ class SupabaseClient(
         private const val TAG = "SupabaseClient"
         private const val REALTIME_TOPIC = "realtime:smartdine-sync"
         const val GOOGLE_OAUTH_REDIRECT_URI = "smartdine://login-callback"
+        const val PRIMARY_OWNER_EMAIL = "amazonpoeter@gmail.com"
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         private const val BASE64_URL_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 

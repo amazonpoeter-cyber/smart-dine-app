@@ -718,6 +718,9 @@ class RestaurantViewModel(
                     .replaceFirstChar { it.uppercase() }
             }
         }
+        val isOwnerOrAdmin = session.role.equals("owner", ignoreCase = true) ||
+            session.role.equals("admin", ignoreCase = true) ||
+            session.email.trim().equals(com.example.data.supabase.SupabaseClient.PRIMARY_OWNER_EMAIL, ignoreCase = true)
         val profile = CustomerProfile(
             id = session.userId,
             name = resolvedName,
@@ -729,15 +732,20 @@ class RestaurantViewModel(
         _uiState.update { state ->
             state.copy(
                 loggedInCustomer = profile,
+                isAdminAuthenticated = isOwnerOrAdmin || state.isAdminAuthenticated,
+                authenticatedEmployeeId = if (isOwnerOrAdmin) null else state.authenticatedEmployeeId,
+                adminTab = if (isOwnerOrAdmin) AdminTab.OWNER_DASHBOARD else state.adminTab,
                 customerMode = CustomerExperienceMode.HOME_DELIVERY,
-                toastMessage = if (state.appLanguage == AppLanguage.UR) {
-                    "خوش آمدید، $resolvedName"
-                } else {
-                    "Welcome, $resolvedName!"
+                toastMessage = when {
+                    isOwnerOrAdmin -> "Owner Access unlocked ($resolvedName)"
+                    state.appLanguage == AppLanguage.UR -> "خوش آمدید، $resolvedName"
+                    else -> "Welcome, $resolvedName!"
                 }
             )
         }
-        if (repository.isRemoteEnabled) {
+        if (isOwnerOrAdmin) {
+            refreshAuthenticatedWorkspace()
+        } else if (repository.isRemoteEnabled) {
             repository.refreshOrders()?.let { freshOrders ->
                 _uiState.update { state ->
                     val maxOrderNum = freshOrders.maxOfOrNull { it.orderNumber } ?: 100
@@ -746,7 +754,9 @@ class RestaurantViewModel(
                 }
             }
         }
-        return PasswordChangeResult.Success("Signed in as $resolvedName")
+        return PasswordChangeResult.Success(
+            if (isOwnerOrAdmin) "Owner Access unlocked for ${session.email}" else "Signed in as $resolvedName"
+        )
     }
 
     fun logoutCustomer() {
