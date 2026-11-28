@@ -51,8 +51,8 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 data class SupabaseConfig(
-    val projectUrl: String,
-    val publishableKey: String
+    val projectUrl: String = DEFAULT_SUPABASE_URL,
+    val publishableKey: String = DEFAULT_SUPABASE_PUBLISHABLE_KEY
 ) {
     val cleanUrl: String = projectUrl.trim().trimEnd('/')
     val cleanKey: String = publishableKey.trim()
@@ -64,12 +64,30 @@ data class SupabaseConfig(
             !cleanKey.startsWith("sb_secret_")
 
     companion object {
+        const val DEFAULT_SUPABASE_URL = "https://ykpuzpzyjhsiwxasessi.supabase.co"
+        const val DEFAULT_SUPABASE_PUBLISHABLE_KEY = "sb_publishable_jC8DLmcSt9-VmadpAPCmbw_54hzx2Kg"
         private const val PLACEHOLDER_KEY = "YOUR_SUPABASE_PUBLISHABLE_KEY"
 
         fun fromBuildConfig(): SupabaseConfig {
+            val buildUrl = BuildConfig.SUPABASE_URL.trim().trimEnd('/')
+            val buildKey = BuildConfig.SUPABASE_PUBLISHABLE_KEY.trim()
+            val resolvedUrl = if (buildUrl.startsWith("https://")) {
+                buildUrl
+            } else {
+                DEFAULT_SUPABASE_URL
+            }
+            val resolvedKey = if (
+                buildKey.isNotBlank() &&
+                buildKey != PLACEHOLDER_KEY &&
+                !buildKey.startsWith("sb_secret_")
+            ) {
+                buildKey
+            } else {
+                DEFAULT_SUPABASE_PUBLISHABLE_KEY
+            }
             return SupabaseConfig(
-                projectUrl = BuildConfig.SUPABASE_URL,
-                publishableKey = BuildConfig.SUPABASE_PUBLISHABLE_KEY
+                projectUrl = resolvedUrl,
+                publishableKey = resolvedKey
             )
         }
     }

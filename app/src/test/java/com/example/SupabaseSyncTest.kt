@@ -60,6 +60,16 @@ class SupabaseSyncTest {
             publishableKey = "sb_publishable_demo_key_12345"
         )
         assertFalse(insecureHttp.isConfigured)
+
+        val defaultConfig = SupabaseConfig()
+        assertTrue(defaultConfig.isConfigured)
+        assertEquals("https://ykpuzpzyjhsiwxasessi.supabase.co", defaultConfig.cleanUrl)
+        assertEquals("sb_publishable_jC8DLmcSt9-VmadpAPCmbw_54hzx2Kg", defaultConfig.cleanKey)
+
+        val buildConfig = SupabaseConfig.fromBuildConfig()
+        assertTrue(buildConfig.isConfigured)
+        assertEquals("https://ykpuzpzyjhsiwxasessi.supabase.co", buildConfig.cleanUrl)
+        assertEquals("sb_publishable_jC8DLmcSt9-VmadpAPCmbw_54hzx2Kg", buildConfig.cleanKey)
     }
 
     @Test

@@ -2,6 +2,7 @@ package com.example
 
 import com.example.data.InMemoryCredentialStorage
 import com.example.data.InMemoryMenuStorage
+import com.example.data.supabase.NoOpSupabaseService
 import com.example.data.supabase.SupabaseAuthResult
 import com.example.data.supabase.SupabaseAuthSession
 import com.example.data.supabase.SupabaseRealtimeEvent
@@ -48,7 +49,7 @@ class RestaurantViewModelTest {
 
     @Test
     fun freshInstall_startsLoggedOutWithNoMockOperationalDataAndMenuAccessible() {
-        val vm = RestaurantViewModel()
+        val vm = RestaurantViewModel(InMemoryMenuStorage(), InMemoryCredentialStorage(), NoOpSupabaseService())
         val state = vm.uiState.value
 
         assertFalse(state.isAdminAuthenticated)
@@ -312,14 +313,14 @@ class RestaurantViewModelTest {
         val ok = vm.changeEmployeePassword(chef.id, "TariqPass1", "TariqNew99", "TariqNew99")
         assertTrue(ok is PasswordChangeResult.Success)
 
-        val restartedVm = RestaurantViewModel(menuStorage, credStorage)
+        val restartedVm = RestaurantViewModel(menuStorage, credStorage, NoOpSupabaseService())
         assertTrue(restartedVm.loginEmployeeWithCnic("34601-1111111-1", "TariqPass1") is EmployeeLoginResult.Error)
         assertTrue(restartedVm.loginEmployeeWithCnic("34601-1111111-1", "TariqNew99") is EmployeeLoginResult.Success)
     }
 
     @Test
     fun salesAnalytics_tracksDeliveryAndKioskMultiChannelRevenue() {
-        val vm = RestaurantViewModel()
+        val vm = RestaurantViewModel(InMemoryMenuStorage(), InMemoryCredentialStorage(), NoOpSupabaseService())
         val today = DateUtils.todayIso()
         assertTrue(vm.uiState.value.salesRecords.isEmpty())
 
@@ -394,7 +395,7 @@ class RestaurantViewModelTest {
         )
         vm.toggleItemAvailability(added.id)
 
-        val restartedVm = RestaurantViewModel(storage)
+        val restartedVm = RestaurantViewModel(storage, InMemoryCredentialStorage(), NoOpSupabaseService())
         val persistedItem = restartedVm.uiState.value.menuItems.firstOrNull { it.id == added.id }
         assertNotNull(persistedItem)
         assertEquals("Butter Garlic Naan", persistedItem!!.title)
@@ -403,7 +404,7 @@ class RestaurantViewModelTest {
 
     @Test
     fun kioskMode_opensAndExitsWithoutAdminPasswordAndIssuesSequentialTokens() {
-        val vm = RestaurantViewModel()
+        val vm = RestaurantViewModel(InMemoryMenuStorage(), InMemoryCredentialStorage(), NoOpSupabaseService())
 
         vm.activateKioskMode()
         assertTrue(vm.uiState.value.isKioskModeActive)
@@ -442,7 +443,7 @@ class RestaurantViewModelTest {
 
     @Test
     fun homeDeliveryOrder_validatesMandatoryFieldsAndSendsDeliveryOrderToKds() {
-        val vm = RestaurantViewModel()
+        val vm = RestaurantViewModel(InMemoryMenuStorage(), InMemoryCredentialStorage(), NoOpSupabaseService())
         assertEquals(CustomerExperienceMode.HOME_DELIVERY, vm.uiState.value.customerMode)
 
         val pizza = vm.uiState.value.menuItems.first { it.id == "item_2" }
@@ -740,7 +741,7 @@ class RestaurantViewModelTest {
     fun bilingualToggle_switchesBetweenEnglishAndUrduAndPersists() {
         val menuStorage = InMemoryMenuStorage()
         val credStorage = InMemoryCredentialStorage()
-        val vm = RestaurantViewModel(menuStorage, credStorage)
+        val vm = RestaurantViewModel(menuStorage, credStorage, NoOpSupabaseService())
 
         assertEquals(AppLanguage.EN, vm.uiState.value.appLanguage)
         assertFalse(AppStrings.forLanguage(vm.uiState.value.appLanguage).isUrdu)
@@ -751,13 +752,13 @@ class RestaurantViewModelTest {
         assertTrue(urStrings.isUrdu)
         assertEquals("آپ کا آرڈر راستے میں ہے اور جلد پہنچ جائے گا!", urStrings.onTheWayBanner)
 
-        val restartedVm = RestaurantViewModel(menuStorage, credStorage)
+        val restartedVm = RestaurantViewModel(menuStorage, credStorage, NoOpSupabaseService())
         assertEquals(AppLanguage.UR, restartedVm.uiState.value.appLanguage)
     }
 
     @Test
     fun thermalReceiptData_formatsKioskTokenAndDeliveryReceiptsAccurately() {
-        val vm = RestaurantViewModel()
+        val vm = RestaurantViewModel(InMemoryMenuStorage(), InMemoryCredentialStorage(), NoOpSupabaseService())
         vm.activateKioskMode()
         val burger = vm.uiState.value.menuItems.first { it.id == "item_1" }
         vm.addToCart(burger)

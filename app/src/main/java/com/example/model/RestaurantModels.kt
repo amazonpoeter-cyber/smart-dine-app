@@ -384,7 +384,7 @@ data class RestaurantUiState(
         }
 
     val todayGrossRevenueRs: Int
-        get() = salesRecords.firstOrNull { it.dateIso == DateUtils.todayIso() }?.grossRevenueRs ?: 184500
+        get() = salesRecords.firstOrNull { it.dateIso == DateUtils.todayIso() }?.grossRevenueRs ?: 0
 
     val todayHourlyBars: List<SalesBarPoint>
         get() = salesRecords.firstOrNull { it.dateIso == DateUtils.todayIso() }?.hourlyBars ?: emptyList()
